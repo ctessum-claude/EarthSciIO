@@ -94,6 +94,15 @@ Every reader MUST decode identically, or cross-language equality fails. Pinned:
   to wall-clock instants is **ESS's** job, not the reader's.
 - **Variable identity** — arrays are keyed by the **on-disk `file_variable`**
   name. No remap, no `unit_conversion` (Risk R3 — those stay in ESS).
+- **Projection (`variables`)** — a loader's `variables` are pushed INTO the
+  reader wherever the format can honour them (`parquet` column chunks;
+  `netcdf`, where an unrequested variable is simply never decoded — a GEOS-FP A1
+  file carries 47 and a loader wants one), rather than being applied to an
+  already-decoded dataset. **Coordinates are always returned**; an **empty** list
+  means every data variable, never none; a requested name absent from the blob is
+  an error listing what is present, never a silently missing array. A reader with
+  no such option keeps the read-everything-then-select path, which must produce
+  the identical result.
 - **Strings** — text columns (CSV/JSON) are returned as `string` arrays verbatim.
 - **FF10 zip member selection** — an `ff10` blob may be a `.zip`; the reader's
   `member` (singular), `members` (explicit list), and `member_glob`

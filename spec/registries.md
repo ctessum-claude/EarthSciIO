@@ -112,7 +112,7 @@ header handling are decode-side).
 
 | name | ext | status | notes |
 |---|---|---|---|
-| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)) |
+| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present |
 | `geotiff` | `tif`,`tiff` | **active** | raster bands via GDAL; Py first, Jl/Rs may lag (R5) |
 | `csv` | `csv` | **active** | points: numeric cols → float64, others → string |
 | `json` | `json` | **active** | points (e.g. station-discovery payloads) |
