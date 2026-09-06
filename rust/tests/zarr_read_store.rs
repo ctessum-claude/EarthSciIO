@@ -233,12 +233,23 @@ fn supports_selection_and_array_shape_capability_surface() {
     assert!(zprovider.supports_selection());
     assert_eq!(zprovider.array_shape("sr").unwrap(), Some(vec![3, 50, 4]));
 
-    // whole-file (netcdf) reader: no pushdown; shape unknown without a read.
+    assert!(zprovider.store_backed());
+
+    // whole-file (netcdf) reader: it DOES honour a select, at decode time, but it
+    // is not store-backed — that pair is how a caller tells "the download shrank"
+    // from "only the decode did". Shape is still unknown without a read.
     let nloader =
         DataSource::new("era5", "netcdf", "https://data.earthsci.dev/era5/2018/11/20181108.nc");
-    let nprovider = Provider::new(nloader, cache, None).unwrap();
-    assert!(!nprovider.supports_selection());
+    let nprovider = Provider::new(nloader, cache.clone(), None).unwrap();
+    assert!(nprovider.supports_selection());
+    assert!(!nprovider.store_backed());
     assert_eq!(nprovider.array_shape("t2m").unwrap(), None);
+
+    // a reader that can honour neither
+    let floader = DataSource::new("nei2016", "ff10", "https://data.earthsci.dev/ff10/x.csv");
+    let fprovider = Provider::new(floader, cache, None).unwrap();
+    assert!(!fprovider.supports_selection());
+    assert!(!fprovider.store_backed());
 }
 
 #[test]
@@ -249,8 +260,8 @@ fn per_call_select_on_whole_file_reader_errors() {
         .verify_on_read(true)
         .build()
         .unwrap();
-    let loader =
-        DataSource::new("era5", "netcdf", "https://data.earthsci.dev/era5/2018/11/20181108.nc");
+    // `ff10` honours no selection at all (`netcdf` now does, at decode time).
+    let loader = DataSource::new("nei2016", "ff10", "https://data.earthsci.dev/ff10/x.csv");
     let mut provider = Provider::new(loader, Arc::new(cache), None).unwrap();
     // A per-call projection on a reader that can't honour it is an error (pre-fetch).
     let sel = Selection::Orthogonal(vec![AxisSelect::All]);

@@ -207,9 +207,13 @@ pub struct DataSource {
     pub mirrors: Vec<String>,
     /// Auth realm to fetch under (resolved by the cache's auth registry).
     pub auth_realm: Option<String>,
-    /// Spatial/orthogonal selection for a **store-backed** reader (e.g. zarr).
-    /// Default [`Selection::All`]; ignored by whole-file readers (the Provider
-    /// still owns temporal record slicing).
+    /// Spatial/orthogonal selection for any reader that answers
+    /// [`Reader::supports_selection`] — the store-backed `zarr` one (which fetches
+    /// only the intersecting chunk objects) and the whole-file `netcdf` one (which
+    /// fetches the same blob under the same cache key and materialises only the
+    /// requested hyperslab). Default [`Selection::All`]; ignored by a reader that
+    /// can honour neither. The Provider still owns temporal record slicing, so a
+    /// selection's time axis must be `All`.
     pub select: Selection,
     /// Format-specific decode options, resolved against the registered reader
     /// by [`Reader::configured`] when the Provider is built — the Rust spelling
@@ -436,14 +440,28 @@ impl Provider {
         &self.coords
     }
 
-    /// True when the bound reader can honour an orthogonal `select` at read time
-    /// (projection pushdown) — a store-backed reader that fetches only the selected
-    /// chunks. False for whole-file readers. A caller uses this to decide whether to
-    /// push a projection down (via [`materialize_with_select`](Self::materialize_with_select))
-    /// or read whole and slice on its own side. Mirrors the Julia/Python
-    /// `supports_selection`.
+    /// True when the bound reader can honour an orthogonal `select` **without
+    /// materialising the whole array**. A caller uses this to decide whether to
+    /// push a projection down (via
+    /// [`materialize_with_select`](Self::materialize_with_select)) or read whole
+    /// and slice on its own side. Mirrors the Julia/Python `supports_selection`.
+    ///
+    /// It says nothing about what is FETCHED — pair it with
+    /// [`store_backed`](Self::store_backed): `zarr` fetches only the intersecting
+    /// chunk objects, so a selection shrinks the download too; `netcdf` fetches
+    /// the same blob under the same cache key and only materialises the requested
+    /// hyperslab.
     pub fn supports_selection(&self) -> bool {
         self.reader.supports_selection()
+    }
+
+    /// True when the bound reader reads a directory-like STORE (a Zarr v2 store,
+    /// each object its own fetch) rather than one blob. Read with
+    /// [`supports_selection`](Self::supports_selection) it tells a caller whether
+    /// a pushed-down `select` shrinks the DOWNLOAD or only the decode.
+    #[must_use]
+    pub fn store_backed(&self) -> bool {
+        self.reader.store_backed()
     }
 
     /// The full native (dims-order) shape of on-disk array `var`, for a
@@ -763,9 +781,20 @@ impl Provider {
                 }
             };
         }
+        // Whole-file reader. The `select` reaches it too: a reader that declares
+        // `supports_selection` without being store-backed (the `netcdf` one)
+        // honours it at DECODE time — the same blob under the same cache key,
+        // with only the requested hyperslab materialised. One that declares
+        // neither was already refused at the call site, so `Selection::All` is
+        // the only thing it can see here.
         let blob = self.fetch_blob(&url)?;
+        let effective = if self.reader.supports_selection() {
+            select
+        } else {
+            &Selection::All
+        };
         self.reader
-            .read_native(&blob.path, &self.loader.variables, &Selection::All)
+            .read_native(&blob.path, &self.loader.variables, effective)
     }
 
     /// Ensure the file covering `file_anchor` is decoded into the 2-entry LRU

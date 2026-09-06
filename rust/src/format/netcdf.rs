@@ -61,12 +61,132 @@ impl Reader for NetcdfReader {
         &self,
         blob_path: &Path,
         variables: &[String],
-        _select: &Selection,
+        select: &Selection,
     ) -> Result<NativeDataset> {
-        // Selection::All is the only variant today; the whole blob is read.
         let file = NcFile::open(blob_path).map_err(fmt_err)?;
-        decode(&file, variables)
+        let sel = dim_selection(&file, select)?;
+        decode(&file, variables, sel.as_ref())
     }
+
+    /// Honours a per-axis `Selection` at DECODE time: the blob is already
+    /// fetched, and only the requested hyperslab is read out of it (the
+    /// `netcdf-reader` slice API reads just the intersecting chunks). NOT
+    /// `store_backed` — the download is unchanged, and that pair is how a caller
+    /// tells the two kinds of selection apart.
+    fn supports_selection(&self) -> bool {
+        true
+    }
+}
+
+/// One dimension's selection: the ordered, 0-based global indices to return.
+type DimSelection = std::collections::HashMap<String, Vec<usize>>;
+
+/// Is `dim` the file's TIME axis?
+///
+/// A same-named coordinate variable whose `units` is CF `"<step> since <ref>"`
+/// settles it; a dimension literally named `time` with no coordinate variable
+/// (the GEOS-FP shape) is taken at its word. Only used to REFUSE a time
+/// selection — record selection is the Provider's job — so erring towards "yes"
+/// costs a clear error, never a wrong array.
+fn is_time_dim(vars: &[NcVariable], dim: &str) -> bool {
+    for v in vars {
+        if v.name() == dim {
+            if let Some(units) = att_text(v, "units") {
+                if units.split_whitespace().any(|w| w.eq_ignore_ascii_case("since")) {
+                    return true;
+                }
+            }
+        }
+    }
+    dim.eq_ignore_ascii_case("time")
+}
+
+/// Resolve a `Selection` into `{dimension: ordered 0-based indices}`.
+///
+/// The axes are positional over the file-order dims of every array whose rank
+/// equals the axis count (the zarr rule); the induced map is what the decode
+/// applies BY NAME, which is what keeps the coordinate variables in step with
+/// the data they index. NetCDF dimension lengths are file-global, so each axis
+/// resolves once.
+///
+/// "The arrays" means the FIELDS this blob decodes to, so the rank a variable
+/// offers is [`field_dims`]'s, not `var.dimensions()`'s, and a variable that
+/// decodes to no field at all (compound/opaque/enum/vlen) offers none. The two
+/// differ for exactly one shape and it matters enormously: a `char label(n,
+/// strlen)` is a rank-1 field on two on-disk dimensions, so counting its
+/// dimensions would let a 2-axis `select` "match" a variable nobody can index
+/// that way, bind axis 0 to `n` and axis 1 to a string LENGTH, and then apply
+/// those selectors by name to every other array in the file — silently moving
+/// which dimension a selector means for the numeric variables the caller was
+/// actually windowing.
+fn dim_selection(file: &NcFile, select: &Selection) -> Result<Option<DimSelection>> {
+    let axes = match select {
+        Selection::All => return Ok(None),
+        Selection::Orthogonal(axes) => axes,
+    };
+    let vars: Vec<NcVariable> = file.variables().map_err(fmt_err)?.to_vec();
+
+    let mut bydim: Vec<(String, &super::AxisSelect, usize)> = Vec::new();
+    let mut matched = false;
+    for var in &vars {
+        if classify(var).is_none() {
+            continue;
+        }
+        let (dims, shape) = field_dims(&vars, var);
+        if dims.len() != axes.len() {
+            continue;
+        }
+        matched = true;
+        for ((axis, name), len) in axes.iter().zip(dims.iter()).zip(shape.iter()) {
+            match bydim.iter().find(|(seen_name, _, _)| seen_name == name) {
+                Some((_, seen, _)) if *seen != axis => {
+                    return Err(Error::Format {
+                        format: "netcdf".to_string(),
+                        detail: format!(
+                            "select is ambiguous: dimension '{}' is asked for two different \
+                             selectors by two rank-{} variables in this blob; a netcdf \
+                             `select` is positional over file-order dims and must agree",
+                            name,
+                            axes.len()
+                        ),
+                    })
+                }
+                Some(_) => {}
+                None => bydim.push((name.clone(), axis, *len)),
+            }
+        }
+    }
+    if !matched {
+        return Err(Error::Format {
+            format: "netcdf".to_string(),
+            detail: format!(
+                "select has {} axes but no variable in the blob has rank {}; a netcdf \
+                 `select` is positional over the file-order dims of the arrays it applies to",
+                axes.len(),
+                axes.len()
+            ),
+        });
+    }
+
+    let mut out = DimSelection::new();
+    for (name, axis, len) in bydim {
+        if matches!(axis, super::AxisSelect::All) {
+            continue;
+        }
+        if is_time_dim(&vars, &name) {
+            return Err(Error::Format {
+                format: "netcdf".to_string(),
+                detail: format!(
+                    "select asks for a subset of the time dimension '{name}'; record \
+                     selection is the Provider's (it owns the cadence: \
+                     records_per_sample), not the reader's — the time axis of a netcdf \
+                     `select` must be \"all\""
+                ),
+            });
+        }
+        out.insert(name, axis.resolve_in(len, "netcdf")?);
+    }
+    Ok(if out.is_empty() { None } else { Some(out) })
 }
 
 /// Decode an opened NetCDF file into native arrays, honoring the `variables`
@@ -76,7 +196,15 @@ impl Reader for NetcdfReader {
 /// the rule the `parquet`/`shapefile` readers and the Python/Julia netcdf
 /// readers already follow, so a typo'd `file_variable` cannot read back as a
 /// silently missing array in this track alone.
-fn decode(file: &NcFile, variables: &[String]) -> Result<NativeDataset> {
+///
+/// `sel` (when present) is the decode-time hyperslab: every array — coordinate
+/// variables included, so a windowed variable never comes back beside a
+/// full-length axis — is read through it.
+fn decode(
+    file: &NcFile,
+    variables: &[String],
+    sel: Option<&DimSelection>,
+) -> Result<NativeDataset> {
     let vars: Vec<NcVariable> = file.variables().map_err(fmt_err)?.to_vec();
     let want: HashSet<&str> = variables.iter().map(String::as_str).collect();
 
@@ -142,7 +270,7 @@ fn decode(file: &NcFile, variables: &[String]) -> Result<NativeDataset> {
             }
             continue;
         };
-        let field = decode_field(file, &vars, var, class)?;
+        let field = decode_field(file, &vars, var, class, sel)?;
 
         if is_coord {
             out.coords.insert(
@@ -237,34 +365,226 @@ fn stacks_last_dimension(vars: &[NcVariable], var: &NcVariable) -> bool {
     })
 }
 
-/// Decode one variable's values into a [`NativeField`] under `class`. `vars` is
-/// every variable in the file — [`stacks_last_dimension`] needs the whole set.
+/// The string-length dimension `var` CONSUMES, if any: the on-disk dimension
+/// that [`stacks_last_dimension`] folds away, so the decoded field never carries
+/// it in `dims`.
+///
+/// This is the one place the two features in this file meet. A consumed
+/// dimension is NOT an axis of the field, so it must not be selectable and must
+/// not be counted when a `select`'s axes are matched positionally against a
+/// variable's rank — `char label(n, strlen)` is a RANK-1 field, whatever its
+/// two on-disk dimensions say. An `NC_STRING` consumes nothing: its elements are
+/// already whole strings, so its last dimension stays a real axis.
+fn consumed_length_dim<'a>(vars: &[NcVariable], var: &'a NcVariable) -> Option<&'a str> {
+    if !matches!(var.dtype(), NcType::Char) || !stacks_last_dimension(vars, var) {
+        return None;
+    }
+    var.dimensions().last().map(|d| d.name.as_str())
+}
+
+/// The `(dims, shape)` of the FIELD `var` decodes to — its on-disk dimensions
+/// minus a consumed string length ([`consumed_length_dim`]).
+///
+/// Every part of this file that reasons about a variable's AXES must go through
+/// here rather than through `var.dimensions()` directly, because for a `char`
+/// array the two disagree and the on-disk answer is the wrong one.
+fn field_dims(vars: &[NcVariable], var: &NcVariable) -> (Vec<String>, Vec<usize>) {
+    let mut dims: Vec<String> = var.dimensions().iter().map(|d| d.name.clone()).collect();
+    let mut shape: Vec<usize> = var.dimensions().iter().map(|d| d.size as usize).collect();
+    if consumed_length_dim(vars, var).is_some() {
+        dims.pop();
+        shape.pop();
+    }
+    (dims, shape)
+}
+
+/// How to read one variable under a decode-time selection: the hyperslab to ask
+/// the file for, its shape, and the per-axis positions to gather out of it.
+///
+/// An ordered index list that is an arithmetic progression (`all`, any `Range`,
+/// a contiguous list) reads as ONE strided hyperslab and needs no gather;
+/// anything else — a permuted or irregular list — reads its BOUNDING slab and
+/// gathers from that. Either way the whole array is never materialised.
+///
+/// Numeric variables only: a slab is planned over the ON-DISK dimensions, which
+/// are the field's axes for every class but [`FieldClass::Text`]. A `char`
+/// array's selection is applied by [`select_text`] instead, over the axes the
+/// decoded field actually has.
+struct Slab {
+    info: netcdf_reader::NcSliceInfo,
+    slab_shape: Vec<usize>,
+    take: Vec<Vec<usize>>,
+    needs_gather: bool,
+}
+
+/// The (step, needs_gather) of an ordered index list, per the rule above.
+fn progression(idxs: &[usize]) -> (u64, bool) {
+    if idxs.len() <= 1 {
+        return (1, false);
+    }
+    if idxs[1] <= idxs[0] {
+        return (1, true); // descending or repeated: gather
+    }
+    let step = idxs[1] - idxs[0];
+    for w in idxs.windows(2) {
+        if w[1] <= w[0] || w[1] - w[0] != step {
+            return (1, true);
+        }
+    }
+    (step as u64, false)
+}
+
+/// Plan the hyperslab read for `var` under `sel`, or `None` when the selection
+/// touches none of its dimensions (read it whole).
+fn plan_slab(var: &NcVariable, sel: Option<&DimSelection>) -> Option<Slab> {
+    let sel = sel?;
+    let dims = var.dimensions();
+    if !dims.iter().any(|d| sel.contains_key(&d.name)) {
+        return None;
+    }
+    let mut selections = Vec::with_capacity(dims.len());
+    let mut slab_shape = Vec::with_capacity(dims.len());
+    let mut take = Vec::with_capacity(dims.len());
+    let mut needs_gather = false;
+    for d in dims.iter() {
+        let len = d.size as usize;
+        match sel.get(&d.name) {
+            None => {
+                selections.push(netcdf_reader::NcSliceInfoElem::Slice {
+                    start: 0,
+                    end: len as u64,
+                    step: 1,
+                });
+                slab_shape.push(len);
+                take.push((0..len).collect());
+            }
+            Some(idxs) => {
+                let lo = *idxs.iter().min().unwrap_or(&0);
+                let hi = *idxs.iter().max().unwrap_or(&0);
+                let (step, gather) = progression(idxs);
+                let step = if gather { 1 } else { step };
+                selections.push(netcdf_reader::NcSliceInfoElem::Slice {
+                    start: lo as u64,
+                    end: (hi + 1) as u64,
+                    step,
+                });
+                let count = (hi - lo) / (step as usize) + 1;
+                slab_shape.push(count);
+                take.push(idxs.iter().map(|g| (g - lo) / (step as usize)).collect());
+                needs_gather |= gather;
+            }
+        }
+    }
+    Some(Slab {
+        info: netcdf_reader::NcSliceInfo { selections },
+        slab_shape,
+        take,
+        needs_gather,
+    })
+}
+
+/// Gather `take` out of a row-major slab of `slab_shape`, preserving the
+/// requested index ORDER on every axis (a reader that sorted them fails the
+/// permuted corpus case).
+///
+/// `Clone` rather than `Copy` so the one gather serves both the numeric slabs
+/// and [`select_text`]'s `String` cells — two gathers would be two chances to
+/// get the row-major arithmetic subtly different in one of them.
+fn gather<T: Clone>(flat: &[T], slab_shape: &[usize], take: &[Vec<usize>]) -> Vec<T> {
+    let out_shape: Vec<usize> = take.iter().map(Vec::len).collect();
+    let n: usize = out_shape.iter().product();
+    let mut src_strides = vec![1usize; slab_shape.len()];
+    for i in (0..slab_shape.len().saturating_sub(1)).rev() {
+        src_strides[i] = src_strides[i + 1] * slab_shape[i + 1];
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut idx = vec![0usize; out_shape.len()];
+    for _ in 0..n {
+        let mut off = 0;
+        for (ax, &k) in idx.iter().enumerate() {
+            off += take[ax][k] * src_strides[ax];
+        }
+        out.push(flat[off].clone());
+        for ax in (0..idx.len()).rev() {
+            idx[ax] += 1;
+            if idx[ax] < out_shape[ax] {
+                break;
+            }
+            idx[ax] = 0;
+        }
+    }
+    out
+}
+
+/// Read one variable's values as f64, whole or through the selection's slab.
+/// `unpacked` applies CF scale/offset + `_FillValue`->NaN; the raw path does not.
+fn read_values(
+    file: &NcFile,
+    var: &NcVariable,
+    slab: Option<&Slab>,
+    unpacked: bool,
+) -> Result<(Vec<f64>, Vec<usize>)> {
+    let name = var.name();
+    let Some(slab) = slab else {
+        let arr = if unpacked {
+            file.read_variable_unpacked_masked(name).map_err(fmt_err)?
+        } else {
+            file.read_variable_as_f64(name).map_err(fmt_err)?
+        };
+        let shape: Vec<usize> = var.dimensions().iter().map(|d| d.size as usize).collect();
+        return Ok((arr.iter().copied().collect(), shape));
+    };
+    let arr = if unpacked {
+        file.read_variable_slice_unpacked_masked(name, &slab.info)
+            .map_err(fmt_err)?
+    } else {
+        file.read_variable_slice_as_f64(name, &slab.info)
+            .map_err(fmt_err)?
+    };
+    let flat: Vec<f64> = arr.iter().copied().collect();
+    let out_shape: Vec<usize> = slab.take.iter().map(Vec::len).collect();
+    if slab.needs_gather {
+        Ok((gather(&flat, &slab.slab_shape, &slab.take), out_shape))
+    } else {
+        Ok((flat, out_shape))
+    }
+}
+
+/// Decode one variable's values into a [`NativeField`] under `class`, honoring
+/// the decode-time selection `sel` (`None` ⇒ the whole array). `vars` is every
+/// variable in the file — [`stacks_last_dimension`] needs the whole set.
+///
+/// `dims`/`shape` come from [`field_dims`], not from `var.dimensions()`: for a
+/// `char` array whose last dimension is a string length the two differ, and a
+/// field reported on its on-disk dims would claim an axis it does not have.
 fn decode_field(
     file: &NcFile,
     vars: &[NcVariable],
     var: &NcVariable,
     class: FieldClass,
+    sel: Option<&DimSelection>,
 ) -> Result<NativeField> {
-    let dims: Vec<String> = var.dimensions().iter().map(|d| d.name.clone()).collect();
-    let shape: Vec<usize> = var.dimensions().iter().map(|d| d.size as usize).collect();
-    let name = var.name();
+    let (dims, shape) = field_dims(vars, var);
 
     match class {
-        FieldClass::Text => decode_text_field(file, vars, var, dims, shape),
+        // Text is NOT read through a hyperslab; `sel` is applied to the decoded
+        // strings instead. See [`select_text`] for why, and for what the
+        // consumed string-length dimension does with a selection.
+        FieldClass::Text => decode_text_field(file, vars, var, dims, shape, sel),
         FieldClass::Float => {
             // scale_factor/add_offset applied in double; _FillValue/missing_value
             // folded to NaN. Values are row-major (C order) per `shape`.
-            let arr = file.read_variable_unpacked_masked(name).map_err(fmt_err)?;
+            let (data, shape) = read_values(file, var, plan_slab(var, sel).as_ref(), true)?;
             Ok(NativeField {
                 dtype: DType::Float64,
                 dims,
                 shape,
-                data: ArrayData::F64(arr.iter().copied().collect()),
+                data: ArrayData::F64(data),
                 fill_value: None, // folded into NaN
             })
         }
         FieldClass::Int32 => {
-            let raw = file.read_variable_as_f64(name).map_err(fmt_err)?;
+            let (raw, shape) = read_values(file, var, plan_slab(var, sel).as_ref(), false)?;
             Ok(NativeField {
                 dtype: DType::Int32,
                 dims,
@@ -274,7 +594,7 @@ fn decode_field(
             })
         }
         FieldClass::Int64 => {
-            let raw = file.read_variable_as_f64(name).map_err(fmt_err)?;
+            let (raw, shape) = read_values(file, var, plan_slab(var, sel).as_ref(), false)?;
             Ok(NativeField {
                 dtype: DType::Int64,
                 dims,
@@ -296,7 +616,8 @@ fn decode_field(
 /// - **`char` whose last dimension is a string length**
 ///   ([`stacks_last_dimension`]): that dimension is consumed, so `dims`/`shape`
 ///   lose their last entry — `char label(n, strlen)` is `n` strings, and a 1-D
-///   `char label(strlen)` is a scalar string on `dims == []`.
+///   `char label(strlen)` is a scalar string on `dims == []`. `dims`/`shape`
+///   arrive already trimmed, from [`field_dims`].
 /// - **`char` whose last dimension is a real axis**: one one-character string
 ///   per byte, `dims`/`shape` unchanged.
 ///
@@ -305,25 +626,26 @@ fn decode_field(
 /// it is byte-for-byte numpy's `|S` semantics, which is what makes the Python
 /// track agree: a lone NUL byte decodes to the EMPTY string, as numpy's `|S1`
 /// does, not to a `"\0"`.
+///
+/// The decode-time `sel` is applied afterwards, by [`select_text`].
 fn decode_text_field(
     file: &NcFile,
     vars: &[NcVariable],
     var: &NcVariable,
-    mut dims: Vec<String>,
-    mut shape: Vec<usize>,
+    dims: Vec<String>,
+    shape: Vec<usize>,
+    sel: Option<&DimSelection>,
 ) -> Result<NativeField> {
     let name = var.name();
     // Both backends flatten a char array by its last dimension and NUL-strip each
     // group; for an `NC_STRING` each element is already its own string.
     let groups = file.read_variable_as_strings(name).map_err(fmt_err)?;
 
-    let values = if matches!(var.dtype(), NcType::String) {
+    let values = if consumed_length_dim(vars, var).is_some() {
+        // The last dimension was the string length; `field_dims` already dropped
+        // it, and `netcdf-reader` grouped by exactly that dimension.
         groups
-    } else if stacks_last_dimension(vars, var) {
-        // The last dimension was the string length: drop it from the logical
-        // shape. `netcdf-reader` grouped by exactly that dimension already.
-        dims.pop();
-        shape.pop();
+    } else if matches!(var.dtype(), NcType::String) {
         groups
     } else {
         // A real axis: every byte is its own one-character string. Rebuild that
@@ -383,6 +705,8 @@ fn decode_text_field(
         });
     }
 
+    let (values, shape) = select_text(vars, var, &dims, shape, values, sel)?;
+
     Ok(NativeField {
         dtype: DType::Str,
         dims,
@@ -390,6 +714,76 @@ fn decode_text_field(
         data: ArrayData::Str(values),
         fill_value: None,
     })
+}
+
+/// Apply the decode-time selection to an already-decoded text field, over the
+/// axes the FIELD has.
+///
+/// A `select` is applied by dimension NAME to every array and every coordinate,
+/// so a `char` variable is not exempt: `char label(n)` beside `float value(n)`
+/// must lose the same rows `value` loses, or the two come back describing
+/// different cells. What differs from the numeric path is only HOW:
+///
+/// - **No hyperslab.** `netcdf-reader` has no slicing twin of
+///   `read_variable_as_strings`, and the NUL-stripping/numpy-`|S` semantics that
+///   make this track agree with xarray byte for byte live inside that call.
+///   Slicing raw `char` bytes would mean re-deriving them here, risking a wrong
+///   STRING to save reading a label array; the gridded arrays the hyperslab
+///   exists for are never text. So the strings are decoded whole and gathered.
+/// - **A consumed string-length dimension is NOT selectable.** It is not an axis
+///   of the field ([`consumed_length_dim`]), so a selection naming it is an
+///   ERROR, not a no-op: honouring it would slice CHARACTERS off every string
+///   (`"efgh"` handed back as `"ef"`), and ignoring it would hand back the full
+///   array while the caller believes it asked for a window — the silent kind of
+///   wrong this reader's rules exist to prevent. [`dim_selection`]'s rank
+///   matching cannot produce such a name (that is what [`field_dims`] is for),
+///   so this is the guard on the invariant, not a reachable user path.
+/// - **A zero-length axis is legal**, exactly as for a numeric field: it stays in
+///   `dims` at length 0 and selects no strings.
+fn select_text(
+    vars: &[NcVariable],
+    var: &NcVariable,
+    dims: &[String],
+    shape: Vec<usize>,
+    values: Vec<String>,
+    sel: Option<&DimSelection>,
+) -> Result<(Vec<String>, Vec<usize>)> {
+    let Some(sel) = sel else {
+        return Ok((values, shape));
+    };
+    if let Some(strlen) = consumed_length_dim(vars, var) {
+        if sel.contains_key(strlen) {
+            return Err(Error::Format {
+                format: "netcdf".to_string(),
+                detail: format!(
+                    "select asks for a subset of '{strlen}', which is the string \
+                     LENGTH of the char variable {:?}, not an axis of it; the \
+                     decoded field has dims {dims:?}, and selecting along a string \
+                     length would truncate every string rather than choose cells",
+                    var.name()
+                ),
+            });
+        }
+    }
+    if !dims.iter().any(|d| sel.contains_key(d)) {
+        return Ok((values, shape));
+    }
+    let take: Vec<Vec<usize>> = dims
+        .iter()
+        .zip(shape.iter())
+        .map(|(d, &len)| match sel.get(d) {
+            Some(idxs) => idxs.clone(),
+            None => (0..len).collect(),
+        })
+        .collect();
+    let out_shape: Vec<usize> = take.iter().map(Vec::len).collect();
+    // A legal zero-length axis reads NOTHING; `gather` would otherwise be asked
+    // for a product of zero cells out of a full array, which is harmless but
+    // says less about the intent than short-circuiting does.
+    if out_shape.iter().any(|&n| n == 0) {
+        return Ok((Vec::new(), out_shape));
+    }
+    Ok((gather(&values, &shape, &take), out_shape))
 }
 
 /// A surviving integer fill sentinel (`_FillValue`, else `missing_value`).
