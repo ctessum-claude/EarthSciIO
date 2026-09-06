@@ -33,6 +33,7 @@ import numpy as np
 
 from .native import NativeDataset, NativeField
 from .registry import Registry, format_registry
+from .selection import _parse_axis, _resolve_axis_indices, _select_axes
 
 __all__ = [
     "NetCDFReader",
@@ -105,6 +106,90 @@ def _netcdf_engine() -> Optional[str]:
     return None
 
 
+def _is_cf_time(attrs: Any) -> bool:
+    """A CF time axis: ``units`` of the form ``"<step> since <reference>"``."""
+    units = attrs.get("units")
+    return bool(units) and " since " in f" {str(units).strip()} "
+
+
+def _netcdf_is_time_dim(ds: Any, dim: str) -> bool:
+    """Is ``dim`` the file's time axis?
+
+    A same-named coordinate whose ``units`` is CF ``"<step> since <ref>"`` settles
+    it; a dimension literally named ``time`` with no coordinate (the GEOS-FP
+    shape) is taken at its word. Only used to REFUSE a time selection — record
+    selection is the Provider's job — so erring towards "yes" costs a clear
+    error, never a wrong array.
+    """
+    if dim in ds.variables and _is_cf_time(ds[dim].attrs):
+        return True
+    return str(dim).lower() == "time"
+
+
+def _netcdf_dim_selection(ds: Any, select: Optional[Any]) -> Optional[Dict[str, List[int]]]:
+    """``select`` → ``{dimension: ordered 0-based index list}``, or ``None``.
+
+    The axes are positional over the file-order dims of every array whose rank
+    matches the axis count (the zarr rule); the induced map is what the read
+    applies BY NAME, which is what keeps the coordinates in step with the data.
+    NetCDF dimension lengths are file-global, so each axis resolves once.
+    """
+    axes_spec = _select_axes(select)
+    if axes_spec is None:
+        return None
+    parsed = [_parse_axis(a) for a in axes_spec]
+    naxes = len(parsed)
+
+    bydim: Dict[str, Tuple] = {}
+    matched = False
+    for name, da in ds.variables.items():
+        if len(da.dims) != naxes:
+            continue
+        matched = True
+        for axis, dim in zip(parsed, da.dims):
+            dim = str(dim)
+            if dim in bydim and bydim[dim] != axis:
+                raise ValueError(
+                    f"select is ambiguous: dimension {dim!r} is asked for two "
+                    "different selectors by two rank-"
+                    f"{naxes} variables in this blob; a netcdf `select` is "
+                    "positional over file-order dims and must agree"
+                )
+            bydim[dim] = axis
+    if not matched:
+        raise ValueError(
+            f"select has {naxes} axes but no variable in the blob has rank "
+            f"{naxes}; a netcdf `select` is positional over the file-order dims "
+            "of the arrays it applies to"
+        )
+
+    out: Dict[str, List[int]] = {}
+    for dim, axis in bydim.items():
+        if axis[0] == "all":
+            continue
+        if _netcdf_is_time_dim(ds, dim):
+            raise ValueError(
+                f"select asks for a subset of the time dimension {dim!r}; record "
+                "selection is the Provider's (it owns the cadence: "
+                "records_per_sample), not the reader's — the time axis of a "
+                'netcdf `select` must be "all"'
+            )
+        out[dim] = _resolve_axis_indices(axis, int(ds.sizes[dim]))
+    return out or None
+
+
+def _netcdf_window(da: Any, isel: Optional[Dict[str, List[int]]]) -> Any:
+    """Apply the dimension selection to one ``DataArray`` (identity when empty).
+
+    ``.isel`` with an index list is xarray's orthogonal indexing: it reads only
+    the intersecting chunks and returns the indices in the order given.
+    """
+    if not isel:
+        return da
+    take = {d: isel[d] for d in map(str, da.dims) if d in isel}
+    return da.isel(take) if take else da
+
+
 class NetCDFReader:
     """The active ``netcdf`` reader, backed by xarray (netCDF4 engine).
 
@@ -115,6 +200,14 @@ class NetCDFReader:
     axis is returned **raw** (its stored integers) with ``units``+``calendar``
     carried in ``attrs`` for ESS. Data variables land in ``variables``;
     dimension coordinates (latitude/longitude/time) land in ``coords``.
+
+    ``variables`` is a projection: an unrequested variable is never read.
+    ``select`` is a DECODE-TIME orthogonal selection — the reader still gets the
+    whole blob (one URL, one cache key, nothing about the fetch changes) but
+    materialises only the requested hyperslab. Hence ``supports_selection = True``
+    while ``store_backed`` stays absent/``False``, which is how a caller tells a
+    decode-scoped selection from the zarr reader's fetch-scoped one. See
+    :meth:`read_native` for the axis rules.
     """
 
     #: Registry name + format key(s) + extension sniff hints.
@@ -123,6 +216,9 @@ class NetCDFReader:
     EXTENSIONS = ("nc", "nc4", "cdf")
     #: Third-party stacks this reader needs (see Registry.register).
     REQUIRES = (("xarray",), ("netCDF4",))
+    #: Honours a per-axis ``select`` without materialising the whole array — at
+    #: DECODE time (see :func:`earthsciio.registry.supports_selection`).
+    supports_selection = True
 
     def formats(self) -> List[str]:
         return list(self.FORMATS)
@@ -147,9 +243,24 @@ class NetCDFReader:
         ``variables`` (on-disk ``file_variable`` names) restricts the returned
         **data variables**; coordinates are always kept. ``None``/empty returns
         all data variables. A requested name absent from the blob is a
-        :class:`KeyError`. ``select`` is accepted for interface parity but record
-        slicing is the Provider's job (it owns the cadence), so the whole file is
-        returned here.
+        :class:`KeyError`.
+
+        ``select`` is an orthogonal selection in the shared 0-based vocabulary
+        (:mod:`earthsciio.selection`): ``{"axes": [...]}`` with each axis
+        ``"all"``, ``{"indices": [...]}`` or ``{"slice": [start, stop, step?]}``.
+        It is honoured at DECODE time — the blob is already fetched, and
+        ``.isel`` reads only the intersecting chunks. Applied thus:
+
+        * the axes are **positional over file-order dims** of every array whose
+          rank equals the axis count (the zarr rule);
+        * that induces a **dimension → selector** map, applied by NAME to every
+          other array **and to the coordinates**, so a windowed variable never
+          comes back beside a full-length ``lon``/``lat``. Two same-rank arrays
+          disagreeing about a dimension is a :class:`ValueError`;
+        * a **time** axis that is not ``"all"`` is REFUSED: record selection
+          belongs to the Provider, which owns the cadence;
+        * an axis count matching no array is a :class:`ValueError`, never a
+          silently ignored selection.
         """
         import xarray as xr  # lazy: only the netcdf path needs the heavy stack
 
@@ -165,12 +276,13 @@ class NetCDFReader:
                         f"requested variables not in blob: {sorted(missing)}; "
                         f"present data variables: {sorted(map(str, ds.data_vars))}"
                     )
+            isel = _netcdf_dim_selection(ds, select)
             for name, da in ds.data_vars.items():
                 if want is not None and str(name) not in want:
                     continue
-                out_vars[str(name)] = _field_from_dataarray(da)
+                out_vars[str(name)] = _field_from_dataarray(_netcdf_window(da, isel))
             for name, da in ds.coords.items():
-                out_coords[str(name)] = _field_from_dataarray(da)
+                out_coords[str(name)] = _field_from_dataarray(_netcdf_window(da, isel))
         return NativeDataset(out_vars, out_coords)
 
 

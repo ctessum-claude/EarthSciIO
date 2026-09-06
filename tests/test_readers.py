@@ -148,6 +148,77 @@ def test_netcdf_absent_variable_raises(offline_cache):
 
 
 # --------------------------------------------------------------------------- #
+# NetCDF decode-time `select`: one blob, one cache key, only the requested
+# hyperslab materialised (spec/conformance.md "NetCDF decode notes").
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_windows_the_decode_and_slices_coords(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+
+    sel = {"axes": ["all", {"slice": [1, 3]}, {"indices": [0, 2]}]}
+    w = reader.read_native(reader.open(blob.path), None, sel)
+
+    # The gate: a windowed read equals the FULL read sliced afterwards.
+    for name in ("t2m", "sp"):
+        expected = full[name].data[:, 1:3][:, :, [0, 2]]
+        assert np.array_equal(w[name].data, expected, equal_nan=True)
+        assert list(w[name].dims) == list(full[name].dims)  # dims are NAMES
+        assert w[name].attrs == full[name].attrs
+
+    # Coordinates are sliced WITH the data — a windowed variable beside a
+    # full-length lon/lat would be a silent trap.
+    assert np.array_equal(w["latitude"].data, full["latitude"].data[1:3])
+    assert np.array_equal(w["longitude"].data, full["longitude"].data[[0, 2]])
+    # the time axis is untouched, and still raw with its units/calendar
+    assert np.array_equal(w["time"].data, full["time"].data)
+    assert w["time"].attrs == full["time"].attrs
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_preserves_the_requested_index_order(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+    p = reader.read_native(reader.open(blob.path), None,
+                           {"axes": ["all", "all", {"indices": [2, 0]}]})
+    assert np.array_equal(p["t2m"].data, full["t2m"].data[:, :, [2, 0]], equal_nan=True)
+    assert np.array_equal(p["longitude"].data, full["longitude"].data[[2, 0]])
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_composes_with_variables(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+    both = reader.read_native(reader.open(blob.path), ["t2m"],
+                              {"axes": ["all", {"slice": [1, 3]}, "all"]})
+    assert both.variable_names() == ["t2m"]
+    assert np.array_equal(both["t2m"].data, full["t2m"].data[:, 1:3], equal_nan=True)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_refuses_a_time_subset(offline_cache):
+    """Record selection is the Provider's — it owns the cadence, not the reader."""
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    with pytest.raises(ValueError, match="time"):
+        reader.read_native(reader.open(blob.path), None,
+                           {"axes": [{"indices": [0]}, "all", "all"]})
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_refuses_an_axis_count_matching_nothing(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    with pytest.raises(ValueError, match="rank"):
+        reader.read_native(reader.open(blob.path), None, {"axes": ["all", "all"]})
+
+
+# --------------------------------------------------------------------------- #
 # CSV decode (numeric_columns -> float64, others -> string) — the 2nd format.
 # --------------------------------------------------------------------------- #
 

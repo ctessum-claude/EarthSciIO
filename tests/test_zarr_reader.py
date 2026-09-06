@@ -432,10 +432,22 @@ def test_supports_selection_and_array_shape_capability_surface(tmp_path):
     assert supports_selection(ZarrReader()) is True
     assert pz.supports_selection is True
 
-    # whole-file readers cannot; array_shape is None (shape unknown without a read)
-    for fmt in ("csv", "ff10", "netcdf"):
+    assert pz.store_backed is True
+
+    # a whole-file reader that honours `select` at DECODE time: it answers
+    # supports_selection but NOT store_backed, which is how a caller tells "the
+    # download shrank" from "only the decode did". array_shape is still None (a
+    # blob's shape is not knowable without reading it).
+    pn = Provider(DataSource(name="era5", format="netcdf", url="file:///dev/null"), cache)
+    assert pn.supports_selection is True
+    assert pn.store_backed is False
+    assert pn.array_shape("anything") is None
+
+    # readers that cannot honour a select at all
+    for fmt in ("csv", "ff10"):
         pw = Provider(DataSource(name="x", format=fmt, url="file:///dev/null"), cache)
         assert pw.supports_selection is False
+        assert pw.store_backed is False
         assert pw.array_shape("anything") is None
     assert supports_selection(CSVReader()) is False
     assert supports_selection(FF10Reader()) is False
