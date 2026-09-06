@@ -68,9 +68,38 @@ impl Reader for NetcdfReader {
 
 /// Decode an opened NetCDF file into native arrays, honoring the `variables`
 /// filter (empty = all data variables; coordinate variables are always kept).
+///
+/// A requested name absent from the blob is an error listing what is present —
+/// the rule the `parquet`/`shapefile` readers and the Python/Julia netcdf
+/// readers already follow, so a typo'd `file_variable` cannot read back as a
+/// silently missing array in this track alone.
 fn decode(file: &NcFile, variables: &[String]) -> Result<NativeDataset> {
     let vars: Vec<NcVariable> = file.variables().map_err(fmt_err)?.to_vec();
     let want: HashSet<&str> = variables.iter().map(String::as_str).collect();
+
+    if !want.is_empty() {
+        let mut present: Vec<&str> = vars
+            .iter()
+            .filter(|v| !v.is_coordinate_variable())
+            .map(NcVariable::name)
+            .collect();
+        present.sort_unstable();
+        let mut missing: Vec<&str> = want
+            .iter()
+            .copied()
+            .filter(|n| !present.contains(n))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            return Err(Error::Format {
+                format: "netcdf".to_string(),
+                detail: format!(
+                    "requested variables not in blob: {missing:?}; \
+                     present data variables: {present:?}"
+                ),
+            });
+        }
+    }
 
     let mut out = NativeDataset::default();
     for var in &vars {
