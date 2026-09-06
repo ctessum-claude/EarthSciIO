@@ -88,8 +88,42 @@ is a real PROJECTION PUSHDOWN — an unrequested variable is never decoded, rath
 than decoded and thrown away. Coordinate fields are always returned (they are the
 native grid the arrays live on). An empty list, like `nothing`, means **every**
 data variable (spec/conformance.md §3), never none; a requested name absent from
-the blob is an error listing what is present."""
+the blob is an error listing what is present.
+
+`select=Dict("axes"=>[...])` is a DECODE-TIME orthogonal selection: the reader
+still fetches the whole blob (one URL, one cache key — nothing about the fetch or
+the cache changes), but materialises only the requested hyperslab, reading only
+the intersecting HDF5 chunks off local disk. `supports_selection` is `true` while
+`store_backed` stays `false`, and that pair is how a caller tells a DECODE-scoped
+selection from the zarr reader's FETCH-scoped one.
+
+The vocabulary is the zarr reader's, unchanged and **0-based**: each axis is
+`"all"`, `Dict("indices"=>[...])` (an explicit, possibly non-contiguous, ordered
+index list, returned in the order given) or `Dict("slice"=>[start, stop, step?])`
+(half-open, `step` defaults to 1). Zero-based is chosen over the AST side's
+1-based convention on purpose: it is ONE `select` spelling across every reader and
+both sibling tracks, so a caller that translates for zarr does not translate
+differently here. Applied thus:
+
+  * the axes are **positional over FILE-order dims** (`[time, lev, lat, lon]` for
+    a GEOS-FP A3dyn variable, i.e. the order `field.dims` reports) of every array
+    whose rank equals the axis count — the zarr rule;
+  * that induces a **dimension-name → selector** map, which is then applied by
+    NAME to every other array **and to the coordinate fields**, so a windowed
+    variable can never come back beside a full-length `lon`/`lat`. Two arrays of
+    matching rank that disagree about a dimension are an error, not a coin toss;
+  * a `select` whose **time axis** is anything but `"all"` is REFUSED: record
+    selection belongs to the Provider, which owns the cadence
+    (`records_per_sample`), not to the reader (spec/conformance.md §3);
+  * an axis count matching no array in the blob is an error rather than a
+    silently-ignored selection."""
 struct NetCDFReader <: Reader end
+
+# Widened capability (spec/registries.md §2): "honours `select` without
+# materialising the whole array". `store_backed` (still `false` here) is what
+# separates a fetch-scoped selection — the zarr reader's, which shrinks the
+# DOWNLOAD — from this decode-scoped one, which shrinks only the decode.
+supports_selection(::NetCDFReader) = true
 
 # A CF time axis is one whose `units` is "<step> since <reference>" (hours since
 # …, days since …). Matching xarray `decode_times=false`, such variables are
@@ -141,7 +175,109 @@ function _netcdf_wanted(ds, dimset::AbstractSet{String}, variables)
     return want
 end
 
-function read_native(::NetCDFReader, path::AbstractString; variables = nothing)
+# Is dimension `d` the file's TIME axis? A same-named coordinate variable whose
+# `units` is CF "<step> since <ref>" settles it; a dimension literally named
+# `time` with no coordinate variable (the GEOS-FP shape) is taken at its word.
+# Only used to REFUSE a time selection — record selection is the Provider's job —
+# so erring towards "yes" costs a clear error, never a wrong array.
+function _netcdf_is_time_dim(ds, d::AbstractString)
+    if haskey(ds, d)
+        _is_cf_time(ds[d].attrib) && return true
+    end
+    return lowercase(String(d)) == "time"
+end
+
+# `select` -> Dict(dimension name => ordered 0-based index list), or `nothing`
+# when nothing is selected. Axes are positional over the FILE-order dims of every
+# array whose rank matches the axis count (the zarr rule); the induced map is what
+# the read applies BY NAME, which is what keeps the coordinates in step with the
+# data. netCDF dimension lengths are file-global, so each axis resolves once.
+function _netcdf_dim_selection(ds, select)
+    axes_spec = _select_axes(select)
+    axes_spec === nothing && return nothing
+    parsed = [_parse_axis(a) for a in axes_spec]
+    naxes = length(parsed)
+
+    bydim = Dict{String,Any}()
+    matched = false
+    for vn in keys(ds)
+        dims = reverse(String.(collect(NCDatasets.dimnames(ds[vn]))))
+        length(dims) == naxes || continue
+        matched = true
+        for (i, d) in enumerate(dims)
+            if haskey(bydim, d) && bydim[d] != parsed[i]
+                throw(ArgumentError(
+                    "select is ambiguous: dimension '$d' is asked for two different " *
+                    "selectors by two rank-$naxes variables in this blob; a netcdf " *
+                    "`select` is positional over file-order dims and must agree"))
+            end
+            bydim[d] = parsed[i]
+        end
+    end
+    matched || throw(ArgumentError(
+        "select has $naxes axes but no variable in the blob has rank $naxes; " *
+        "a netcdf `select` is positional over the file-order dims of the arrays " *
+        "it applies to"))
+
+    out = Dict{String,Vector{Int}}()
+    for (d, ax) in bydim
+        ax[1] === :all && continue
+        _netcdf_is_time_dim(ds, d) && throw(ArgumentError(
+            "select asks for a subset of the time dimension '$d'; record selection " *
+            "is the Provider's (it owns the cadence: `records_per_sample`), not the " *
+            "reader's — the time axis of a netcdf `select` must be \"all\""))
+        out[d] = _resolve_axis(ax, Int(ds.dim[d]))
+    end
+    return isempty(out) ? nothing : out
+end
+
+# An ordered index list as (start, step, needs_gather): an arithmetic progression
+# reads as ONE strided hyperslab; anything else (a permuted or irregular list)
+# reads its bounding slab and gathers out of it — still never the whole array.
+function _netcdf_progression(idxs::Vector{Int})
+    length(idxs) <= 1 && return (1, false)
+    step = idxs[2] - idxs[1]
+    step >= 1 || return (1, true)
+    for k in 3:length(idxs)
+        idxs[k] - idxs[k-1] == step || return (1, true)
+    end
+    return (step, false)
+end
+
+# Read one variable under the dimension selection `sel` (`nothing` ⇒ whole array).
+# `raw` reads the underlying variable with no CF transform (a time axis).
+function _netcdf_read(v, file_dims::Vector{String}, sel, raw::Bool)
+    src = raw ? v.var : v
+    if sel === nothing || !any(haskey(sel, d) for d in file_dims)
+        data = _to_file_order(Array(src))
+        return raw ? data : _finalize_numeric(data)
+    end
+    # Per-axis slab range + local gather positions, in FILE order.
+    nd = length(file_dims)
+    ranges = Vector{Any}(undef, nd)
+    gathers = Vector{Any}(undef, nd)
+    needs_gather = false
+    for (i, d) in enumerate(file_dims)
+        idxs = get(sel, d, nothing)
+        if idxs === nothing
+            ranges[i] = Colon()
+            gathers[i] = Colon()
+            continue
+        end
+        lo, hi = extrema(idxs)
+        step, gather = _netcdf_progression(idxs)
+        ranges[i] = gather ? ((lo + 1):(hi + 1)) : ((lo + 1):step:(hi + 1))
+        gathers[i] = gather ? (idxs .- lo .+ 1) : Colon()
+        needs_gather |= gather
+    end
+    # NCDatasets indexes in its own (reversed) axis order; permute the slab back.
+    data = _to_file_order(Array(src[reverse(ranges)...]))
+    raw || (data = _finalize_numeric(data))
+    return needs_gather ? data[gathers...] : data
+end
+
+function read_native(::NetCDFReader, path::AbstractString; variables = nothing,
+                     select = nothing)
     nds = NativeDataset()
     NCDatasets.NCDataset(String(path), "r") do ds
         dimset = Set(String.(collect(keys(ds.dim))))
@@ -152,6 +288,11 @@ function read_native(::NetCDFReader, path::AbstractString; variables = nothing)
         # parquet reader and the other two tracks follow); an absent name is an
         # error listing what is present, never a silently missing array.
         want = _netcdf_wanted(ds, dimset, variables)
+        # DECODE-TIME SELECTION: one blob is still fetched, but only the requested
+        # hyperslab is materialised (NCDatasets reads just the intersecting HDF5
+        # chunks). Resolved ONCE, per dimension name, so the coordinate fields are
+        # sliced with the data they index rather than left at full length.
+        sel = _netcdf_dim_selection(ds, select)
         for vn in keys(ds)
             name = String(vn)
             # Coordinates are always kept; data variables honour the projection.
@@ -159,14 +300,10 @@ function read_native(::NetCDFReader, path::AbstractString; variables = nothing)
             v = ds[vn]
             attrs = _carry_attrs(v.attrib)
             file_dims = reverse(String.(collect(NCDatasets.dimnames(v))))
-            if _is_cf_time(v.attrib)
-                # Raw, undecoded: read the underlying variable (no CF transform),
-                # so a "hours since …" axis stays the stored integers.
-                data = _to_file_order(Array(v.var))
-            else
-                # mask_and_scale: NCDatasets applies scale/offset + _FillValue→missing.
-                data = _finalize_numeric(_to_file_order(Array(v)))
-            end
+            # A CF time axis is read RAW (no CF transform), so a "hours since …"
+            # axis stays the stored integers; everything else is mask_and_scale'd
+            # (NCDatasets applies scale/offset + _FillValue→missing).
+            data = _netcdf_read(v, file_dims, sel, _is_cf_time(v.attrib))
             field = NativeField(data, file_dims, attrs)
             if String(vn) in dimset
                 nds.coords[String(vn)] = field

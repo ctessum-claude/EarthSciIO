@@ -84,6 +84,12 @@ function _parse_zattrs(bytes, ndim::Int)::Vector{String}
 end
 
 # --- orthogonal selection ---------------------------------------------------
+#
+# ONE vocabulary, shared by every reader that can honour a `select`: these three
+# helpers are also what the whole-file `netcdf` reader parses its decode-time
+# selection with (`readers.jl`), so `"all"` / `{indices: [...]}` /
+# `{slice: [start, stop, step?]}` — 0-based, half-open slice — mean the same thing
+# whichever reader a document points at. Keep them format-neutral.
 
 # `select` (from reader_kwargs) -> the per-axis selector vector, or `nothing`.
 function _select_axes(select)

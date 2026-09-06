@@ -252,10 +252,23 @@ end
     @test supports_selection(ZarrReader())
     @test supports_selection(pz)
 
-    # whole-file readers cannot; array_shape is nothing (shape unknown without read)
-    for fmt in ("csv", "ff10", "netcdf")
+    @test store_backed(pz)
+
+    # a whole-file reader that honours `select` at DECODE time: it answers
+    # supports_selection but NOT store_backed, which is how a caller tells "the
+    # download shrank" from "only the decode did". array_shape is still nothing
+    # (a blob's shape is not knowable without reading it).
+    pn = const_provider(cache, "file:///dev/null"; format = "netcdf")
+    @test supports_selection(pn)
+    @test !store_backed(pn)
+    @test array_shape(pn, "anything") === nothing
+    @test supports_selection(NetCDFReader())
+
+    # readers that cannot honour a select at all
+    for fmt in ("csv", "ff10")
         pw = const_provider(cache, "file:///dev/null"; format = fmt)
         @test !supports_selection(pw)
+        @test !store_backed(pw)
         @test array_shape(pw, "anything") === nothing
     end
     @test !supports_selection(CSVReader())

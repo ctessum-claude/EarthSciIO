@@ -165,9 +165,11 @@ _reader_for(p::Provider) = FORMAT_REGISTRY[p.format]
 #
 # `select` is an optional PER-CALL projection override (component (b) pushdown):
 # `nothing` uses the baked `reader_kwargs[:select]`, a non-`nothing` value
-# OVERRIDES it for this call only. Only a store-backed reader can honour it; a
-# per-call `select` on a whole-file reader is a clear error (the fetch-full
-# fallback belongs to the EarthSciAST caller, not here).
+# OVERRIDES it for this call only. Any reader that answers `supports_selection`
+# can honour it — a store-backed one by fetching fewer objects, a whole-file one
+# by materialising only the requested hyperslab of the blob it already fetched.
+# A `select` handed to a reader that does neither is a clear error, raised BEFORE
+# any fetch (the fetch-full fallback belongs to the EarthSciAST caller, not here).
 function _load(p::Provider, t; select = nothing)
     reader = _reader_for(p)
     # Store-backed readers (e.g. zarr) are handed (cache, base_url; variables,
@@ -183,7 +185,12 @@ function _load(p::Provider, t; select = nothing)
         return read_store(reader, p.cache, p.url_for(t);
                           variables = p.variables, select = effective, rest...)
     end
-    select === nothing || throw(ArgumentError(
+    # Whole-file reader. A `select` — per-call, else the baked one — reaches it
+    # only if it declares `supports_selection`; the netcdf reader does, and honours
+    # it at DECODE time (same blob, same cache key, only the requested hyperslab
+    # materialised). Checked before the fetch so a refusal costs nothing.
+    effective = select === nothing ? get(p.reader_kwargs, :select, nothing) : select
+    effective === nothing || supports_selection(reader) || throw(ArgumentError(
         "reader $(typeof(reader)) does not support select/pushdown"))
     entry = fetch_blob(p.cache, p.url_for(t);
                        source_loader = p.source_loader, auth_realm = p.auth_realm)
@@ -202,11 +209,14 @@ function _load(p::Provider, t; select = nothing)
     # emptiness before using it). Normalised once here so the pushdown and the
     # `_select` below agree — an empty list used to hand back an empty dataset.
     wanted = (p.variables === nothing || isempty(p.variables)) ? nothing : p.variables
-    kw = p.reader_kwargs
+    # `:select` is forwarded explicitly (the per-call value wins over the baked
+    # one), so it is stripped from the splat rather than passed twice.
+    kw = Dict{Symbol,Any}(k => v for (k, v) in p.reader_kwargs if k !== :select)
+    effective === nothing || (kw[:select] = effective)
     if wanted !== nothing && !haskey(kw, :variables)
         opts = reader_option_keys(reader)
         if opts !== nothing && :variables in opts
-            kw = merge(kw, Dict{Symbol,Any}(:variables => wanted))
+            kw[:variables] = wanted
         end
     end
     nds = read_native(reader, entry.path; kw...)
@@ -216,12 +226,28 @@ end
 """
     supports_selection(p::Provider) -> Bool
 
-True when `p`'s format reader can honour an orthogonal `select` at read time
-(projection pushdown) — i.e. it is a store-backed reader that fetches only the
-selected chunks. `false` for whole-file readers. A caller uses this to decide
-whether to push a projection down (via `materialize(p, t; select=…)`) or to read
-whole and slice on its own side."""
+True when `p`'s format reader can honour an orthogonal `select` **without
+materialising the whole array**. A caller uses this to decide whether to push a
+projection down (via `materialize(p, t; select=…)`) or to read whole and slice on
+its own side.
+
+It says nothing about what is FETCHED — pair it with [`store_backed`] for that:
+
+| `supports_selection` | `store_backed` | what a `select` saves | reader |
+|---|---|---|---|
+| `true` | `true`  | fetch **and** decode — only the intersecting objects are downloaded | `zarr` |
+| `true` | `false` | decode only — the whole blob is still fetched under the same cache key | `netcdf` |
+| `false` | — | nothing; a `select` is an error | `csv`, `ff10`, `parquet`, … |"""
 supports_selection(p::Provider) = supports_selection(_reader_for(p))
+
+"""
+    store_backed(p::Provider) -> Bool
+
+True when `p`'s format reader reads a directory-like STORE (a Zarr v2 store, whose
+`.zarray`/`.zattrs`/chunks are each their own object) rather than one fetchable
+blob. Read with [`supports_selection`] it tells a caller whether a pushed-down
+`select` shrinks the DOWNLOAD or only the decode — see the table there."""
+store_backed(p::Provider) = store_backed(_reader_for(p))
 
 """
     array_shape(p::Provider, var::AbstractString) -> Union{Nothing,NTuple{N,Int}}
@@ -435,8 +461,10 @@ must be given a time).
 select shape, e.g. `Dict("axes"=>[...])` with 0-based indices). When supplied it
 OVERRIDES any baked `reader_kwargs[:select]` for this call only, letting a caller
 (EarthSciAST) push a projection down at sample time without rebuilding the
-provider. Only a store-backed reader can honour it ([`supports_selection`]);
-passing `select` to a whole-file reader is an `ArgumentError`."""
+provider. Any reader that answers [`supports_selection`] can honour it — the
+`zarr` reader by fetching only the intersecting chunk objects, the `netcdf` one by
+materialising only the requested hyperslab of the blob it already fetched;
+passing `select` to a reader that cannot is an `ArgumentError`."""
 function materialize(p::Provider, t::Real; select = nothing)
     if p.records_per_sample == 2 && p.time_dim !== nothing
         return _bracket(p, t; select = select)

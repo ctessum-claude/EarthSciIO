@@ -127,11 +127,23 @@ store_backed(::Any) = false
 function read_store end
 
 # Orthogonal-selection (projection-pushdown) capability (additive; default-off).
-# A store-backed reader that can honour a per-axis `select` at read time — fetching
-# only the intersecting chunk objects — declares `supports_selection(::TheReader)
-# = true`. The Provider exposes this (`supports_selection(p::Provider)`) so a caller
-# (EarthSciAST) can decide whether to push a projection down or fall back to a full
-# read on its side. Whole-file readers inherit the `false` default.
+# A reader that can honour a per-axis `select` at read time WITHOUT MATERIALISING
+# THE WHOLE ARRAY declares `supports_selection(::TheReader) = true`. The Provider
+# exposes this (`supports_selection(p::Provider)`) so a caller (EarthSciAST) can
+# decide whether to push a projection down or fall back to a full read on its side.
+#
+# NOTE — it does not say what is FETCHED, and the two are genuinely different:
+#
+#   * store-backed + supports_selection (`zarr`): the selection decides which chunk
+#     OBJECTS are downloaded, so it shrinks the transfer as well;
+#   * whole-file + supports_selection (`netcdf`): the same blob is fetched under the
+#     same cache key and only the requested hyperslab is MATERIALISED, so it shrinks
+#     the decode and the resident arrays, not the download.
+#
+# `store_backed` is how a caller tells those apart — deliberately one existing
+# boolean rather than a second capability, because the AST-side
+# `provider_supports_selection` is a single boolean and a second one would have to
+# be threaded through it. A reader that can do neither inherits the `false` default.
 supports_selection(::Any) = false
 
 """
