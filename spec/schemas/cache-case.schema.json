@@ -47,7 +47,7 @@
     },
     "select": {
       "type": "object",
-      "description": "Optional selection the reader applies before returning arrays. Single-blob cases: e.g. {all_records: true}. Store-backed (zarr) cases: an orthogonal selection {axes: [<axis>, ...]} where each <axis> is \"all\", {indices: [...]}, or {slice: [start, stop, step?]} — applied to arrays whose rank matches the axis count.",
+      "description": "Optional selection the reader applies before returning arrays. Single-blob cases with no selection-capable reader: e.g. {all_records: true}. An ORTHOGONAL selection is {axes: [<axis>, ...]} where each <axis> is \"all\", {indices: [...]}, or {slice: [start, stop, step?]} (0-based, half-open slice) — applied to arrays whose rank matches the axis count. Both the store-backed zarr reader (which fetches only the intersecting chunk objects) and the whole-file netcdf reader (which fetches the same blob under the same cache key and materialises only the requested hyperslab, coordinates sliced with it) take that form; a selection never changes cache_key or content_sha256.",
       "additionalProperties": true
     },
     "decode": {

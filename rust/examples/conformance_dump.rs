@@ -207,6 +207,13 @@ fn dump_case(corpus: &Path, case: &Value, base_formats: &FormatRegistry) -> Valu
         }
         loader = loader.reader_options(options);
     }
+    // Whole-file, but selection-capable (netcdf): a case carrying an orthogonal
+    // `select` is a DECODE-TIME window — the same blob under the same cache key,
+    // with only the requested hyperslab materialised. `parse_selection` yields
+    // `Selection::All` for a case with no `axes`.
+    if fmt == "netcdf" {
+        loader = loader.select(parse_selection(case));
+    }
     // Store-backed (zarr): name the arrays (no .zmetadata to enumerate) + carry
     // the orthogonal selection that drives lazy chunk fetch.
     if formats.get(fmt).map(|r| r.store_backed()).unwrap_or(false) {

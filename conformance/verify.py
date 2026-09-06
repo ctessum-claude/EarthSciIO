@@ -74,17 +74,42 @@ def _cmp_string(got, expected_nested, label: str, errs: list):
         errs.append(f"{label}: string mismatch {g} != {e}")
 
 
-def read_netcdf(path, expected):
-    """CF-decode via xarray: scale/offset + fill->NaN; time NOT decoded."""
+def read_netcdf(path, expected, select=None):
+    """CF-decode via xarray: scale/offset + fill->NaN; time NOT decoded.
+
+    A case carrying an orthogonal ``select`` (``{"axes": [...]}``) is the
+    decode-time window: the oracle reads the array WHOLE and slices it
+    afterwards, deliberately, because "the full read, sliced" is exactly the
+    contract a windowed reader has to reproduce. The axes are positional over the
+    file-order dims of the arrays whose rank matches, which induces the
+    dimension -> indices map applied here to every array AND every coordinate.
+    """
     import xarray as xr
 
+    axes_spec = (select or {}).get("axes")
     out = {}
     with xr.open_dataset(path, decode_times=False, mask_and_scale=True) as ds:
+        take = {}
+        if axes_spec is not None:
+            for _, da in ds.variables.items():
+                if len(da.dims) != len(axes_spec):
+                    continue
+                for spec, dim in zip(axes_spec, da.dims):
+                    take[str(dim)] = _zarr_resolve_axis(spec, int(ds.sizes[dim]))
+
+        def gather(da):
+            idx = {d: take[d] for d in map(str, da.dims) if d in take}
+            values = da.values
+            for axis, dim in enumerate(map(str, da.dims)):
+                if dim in idx:
+                    values = np.take(values, idx[dim], axis=axis)
+            return values
+
         for name in expected["variables"]:
-            out[name] = ds[name].values
+            out[name] = gather(ds[name])
         coords = {}
         for name in expected.get("coords", {}):
-            coords[name] = ds[name].values
+            coords[name] = gather(ds[name])
     return out, coords
 
 
@@ -591,6 +616,11 @@ def verify_case(case_path: pathlib.Path) -> list:
         # gates); the projection is the expected variable set.
         got, coords = read_parquet(CORPUS / case["blob_path"], case["expected"],
                                    case.get("decode"))
+    elif case["format"] == "netcdf":
+        # netcdf takes the case's orthogonal `select` (the decode-time window);
+        # a case without one reads the blob whole, as before.
+        got, coords = read_netcdf(CORPUS / case["blob_path"], case["expected"],
+                                  case.get("select"))
     else:
         got, coords = reader(CORPUS / case["blob_path"], case["expected"])
     for name, spec in case["expected"]["variables"].items():

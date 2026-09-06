@@ -178,6 +178,15 @@ function dump_case(corpus, case)
         const_provider(cache, url; format = fmt,
                        variables = isempty(vars) ? nothing : vars,
                        reader_kwargs = (; kw...))
+    elseif fmt == "netcdf"
+        # Whole-file, but selection-capable: a case carrying an orthogonal
+        # `select` is a DECODE-TIME window — the same blob under the same cache
+        # key, with only the requested hyperslab materialised. A case without
+        # `axes` reads the blob whole (the `{all_records: true}` form).
+        sel = get(case, "select", nothing)
+        axes = sel === nothing ? nothing : get(sel, "axes", nothing)
+        axes === nothing ? const_provider(cache, url; format = fmt) :
+            const_provider(cache, url; format = fmt, reader_kwargs = (; select = sel))
     elseif fmt == "zarr"
         # Store-backed: `url` is the store base; `variables` names the arrays (no
         # .zmetadata to enumerate); `select` (the orthogonal selection) rides in

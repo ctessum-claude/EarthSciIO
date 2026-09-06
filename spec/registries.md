@@ -112,7 +112,7 @@ header handling are decode-side).
 
 | name | ext | status | notes |
 |---|---|---|---|
-| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present |
+| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present. **`select` is honoured at DECODE time**: the same blob is fetched under the same cache key and only the requested hyperslab is materialised, so `supports_selection` is true while `store_backed` stays false. Axes are the shared 0-based vocabulary (`"all"`/`{indices}`/`{slice}`), positional over file-order dims of the arrays whose rank matches, then applied by dimension NAME to every array **and every coordinate**; a time axis that is not `"all"` is refused (record selection is the Provider's). See [conformance.md](conformance.md#decode) "NetCDF decode notes" |
 | `geotiff` | `tif`,`tiff` | **active** | raster bands via GDAL; Py first, Jl/Rs may lag (R5) |
 | `csv` | `csv` | **active** | points: numeric cols → float64, others → string |
 | `json` | `json` | **active** | points (e.g. station-discovery payloads) |
@@ -120,6 +120,29 @@ header handling are decode-side).
 | `ff10` | `ff10`,`csv` | **active** | FF10 point long-format (SMOKE/Emissions.jl `FF10_POINT`): `#` header skipped, fixed 77-col schema, numeric→float64 (blank→NaN), ids/codes/text→string; zip member via reader `member` kwarg; multi-member via `members` (explicit list) and/or `member_glob` (fnmatch-style `*`/`?`/`[...]`, case-sensitive, matched against the full member path) — union, deduplicated, rows concatenated in ascending lexicographic (byte) member-name order; absent explicit member / zero-match glob ⇒ error; directory placeholder entries (names ending `/`) never selected; `member` mutually exclusive with `members`/`member_glob`; `skip_header_row` drops exactly one asserted `country_cd` header line per selected input (first non-comment line's first field must be `country_cd` case-insensitively, else error — never silently drops a data row). None of member/members/member_glob/skip_header_row enter the cache key (the blob is the whole zip). Reader-only (no pivot/convert/normalize/filter) |
 | `parquet` | `parquet`,`parq`,`pq` | **active** (all three tracks) | Apache Parquet as a **flat table**: every column becomes a rank-1 field over `index`, keyed by its on-disk column name, no coordinates. Decoded by a third-party library per track (arrow-rs's `parquet` crate in Rust, pyarrow in Python, Parquet2.jl in Julia). A Parquet column's logical type is explicit, so the dtype is a total function of the Arrow type: `Boolean`→bool; `Int8`/`Int16`/`Int32`/`UInt8`/`UInt16`→int32 and `Int64`/`UInt32`/`UInt64`→int64 (**the same narrow/wide split as `netcdf`**); floats and `Decimal128`/`Decimal256`→float64 (unscaled ÷ 10^scale); `Utf8`/`LargeUtf8`/`Utf8View`→string; `Dictionary(_,V)`→`V` expanded; `Null`→float64 all-NaN. A `uint64` past `int64::MAX` is an error naming the row, never a wraparound. **Temporal columns ride as their raw integer, undecoded** (`Date32`/`Time32`→int32, `Date64`/`Time64`/`Timestamp`/`Duration`→int64): the Arrow unit and timezone are **not** applied, the rule a CF time axis gets, because an epoch offset → instant is ESS's job. Nested/binary columns have no rank-1 reading — naming one in `variables` is an error, unrequested it is simply not a field. **Null policy:** a null float is `NaN` (the CF `_FillValue` fold) with `fill_value` null; a null **integer, string or boolean is an error** naming the column and row, since those types have no NaN and a default would be a real value silently standing in for a missing one. `null_int` (substituted **and** reported in `fill_value`, like a surviving CF integer fill) and `null_string` open that gate only when the document declares them; a boolean has no such option. `float_columns` forces named columns to float64 whatever their on-disk type — the Parquet twin of shapefile's `numeric_columns` — and does double duty: an integer column whose missing cells must be NaN, **and** a column of fixed-decimal **text** (corpora needing byte-reproducible floats store them as strings, not IEEE doubles; the MOVES snapshots write `meanBaseRate` as `"261.000000000000"`), trimmed and parsed, blank→NaN, anything else unparseable an error naming column/row/text. **Column projection pushes down**: `variables` become a `ProjectionMask`, so only those column chunks are read off disk; empty reads all; an absent name is an error listing what is present. A zero-row file is **typed, not absent** (the schema is in the footer). None of `float_columns`/`null_int`/`null_string` enters the cache key. Reader-only (no row selection/filter/code-map/remap/convert) |
 | `zarr` | `zarr` | **active** | **store-backed** Zarr v2: per-array `.zarray`/`.zattrs`, lazy orthogonal chunk selection (fetch only intersecting chunk objects), blosc/lz4+shuffle decode, `<f4`/`<f8`→float64, dims from `_ARRAY_DIMENSIONS`, `fill_value` not→NaN, no coords |
+
+### 2.2 Selection capability (`supports_selection` / `store_backed`)
+
+A reader declares `supports_selection` when it can honour an orthogonal `select`
+**without materialising the whole array**. That is the whole promise; it says
+nothing about what is FETCHED, and the two are genuinely different:
+
+| `supports_selection` | `store_backed` | what a `select` saves | reader |
+|---|---|---|---|
+| `true` | `true` | fetch **and** decode — only the intersecting chunk objects are downloaded | `zarr` |
+| `true` | `false` | decode only — the whole blob is still fetched under the same `sha256(url)` key | `netcdf` |
+| `false` | — | nothing; a `select` aimed at it is an error, raised before any fetch | `csv`, `ff10`, `parquet`, `shapefile`, `geotiff` |
+
+Callers read the pair, and there is deliberately no third capability flag:
+`supports_selection` answers "may I push this down?", `store_backed` answers
+"will the download shrink too?". EarthSciAST's `provider_supports_selection` is a
+single boolean, and a second capability would have to be threaded through it for
+a distinction only a caller optimising *transfers* can act on.
+
+A selection **never** changes the cache key. The blob a whole-file reader windows
+is the same blob it would have read whole, keyed by `sha256(resolved_url)`; the
+`#bytes=<a>-<b>` convention (`cache-format.md` §1) exists for the different case
+where the *fetch* narrows.
 
 **Hard boundary (Risk R3):** the reader applies **read/decode** semantics only —
 CF `scale_factor`/`add_offset`, `_FillValue` → NaN, endianness, chunking. It

@@ -32,6 +32,7 @@ data tooling beyond the format reader.
 | id | loader | kind | format | transport | store | what it pins |
 |---|---|---|---|---|---|---|
 | `era5-grid-sub-tile` | era5 | grid | netcdf | file | local | CF scale/offset + `_FillValue`→NaN + a masked cell; packed int16 → float64 |
+| `era5-window-slice` | era5 | grid | netcdf | file | local | the **same blob and cache key** as `era5-grid-sub-tile`, read through a **decode-time `select`** (lat `{slice:[1,3]}`, lon `{indices:[0,2]}`, time `"all"`). Pins that a whole-file reader materialises only the hyperslab and returns exactly the full read sliced afterwards, that the lat/lon **coordinates are sliced with the data**, that the masked cell still decodes to NaN inside the window, that the time axis is untouched and raw — and that a selection changes the decode, never the fetch |
 | `openaq-points-slice` | openaq | points | csv | file | local | a 2nd reader behind the `format` registry; numeric→float64, text→string |
 | `ff10-point-slice` | nei2016 | points | ff10 | file | local | FF10 point long-format: `#` header skipped, fixed 77-col schema, RFC-4180 quoted `FACILITY_NAME`, numeric→float64 (blank→NaN), ids/codes→string; 3 rows share one stack (no pivot). member=null decodes the extracted CSV member |
 | `ff10-zip-egu-glob` | nei2016 | points | ff10 | file | local | EPA-2016fd-shaped **zip** of FF10 members (two `*egu*` + one excluded + a glob-matching **directory placeholder** entry, ignored), each member with a non-comment `country_cd,…` header line. Pins `member_glob` selection (exclusion, **sorted member-name concatenation**) + `skip_header_row` (one asserted header line dropped per member). The blob is the whole zip; member selection is reader config, never part of the cache key |
@@ -389,12 +390,50 @@ missing array.
 
 An **empty** `variables` list is the same as none at all — every column — and a
 track that reads it as "no columns" disagrees with the other two. (`select` is
-separate and never reaches a whole-file reader.)
+separate, and the `parquet` reader honours none: it declares
+`supports_selection = false`, so the Provider hands it `Selection::All`
+unconditionally and a `select` aimed at it is an error at the call site.)
 
 Row selection is **not** a reader concern: esm-spec §8.9 puts `codes`,
-`record_filter`, `select` and `extent` downstream of the decode, and `select`
-never reaches a whole-file reader at all (the Provider hands one
-`Selection::All` unconditionally). Only `reader_options` reaches this reader.
+`record_filter`, `select` and `extent` downstream of the decode. Only
+`reader_options` reaches this reader.
+
+### NetCDF decode notes (whole-file reader with a decode-time `select`)
+
+The `netcdf` reader fetches ONE blob — a `select` never changes the URL, the
+`sha256(resolved_url)` cache key, or the bytes downloaded (that is what
+distinguishes it from the store-backed zarr reader, and why `store_backed` stays
+`false`). What a selection changes is what gets **materialised**: NCDatasets /
+xarray `.isel` / the `netcdf-reader` slice API each read only the intersecting
+chunks out of the already-fetched blob. The reader therefore declares
+`supports_selection = true` (`registries.md` §2.2).
+
+- **Vocabulary** — the zarr reader's, unchanged and **0-based**:
+  `select = {axes: [<axis>, …]}` with each `<axis>` `"all"`, `{indices: [...]}`
+  (explicit, possibly non-contiguous, returned **in the order given**) or
+  `{slice: [start, stop, step?]}` (half-open, `step` default 1). One spelling
+  across every reader and every track; a caller that translates a 1-based
+  model-side selection for zarr does not translate differently here.
+- **Axis order and base** — the axes are **positional over FILE-order dims** —
+  the order `dims` reports, `[time, lev, lat, lon]` for a GEOS-FP A3dyn variable,
+  which the Julia track reaches by permuting NCDatasets' reversed arrays back —
+  of every array whose **rank equals the axis count** (the zarr rule).
+- **Applied by dimension NAME** — those axes induce a dimension → selector map,
+  which is applied to every other array **and to the coordinate fields**. A
+  windowed variable beside a full-length `lon`/`lat` would be a silent trap, and
+  the zarr reader never had to answer this because it returns no coords. Two
+  same-rank arrays disagreeing about a dimension is an error, not a coin toss.
+- **Time is the Provider's axis** — `records_per_sample` and the cadence belong
+  to the Provider (§3, "Row selection is not a reader concern"), so a `select`
+  whose time axis is anything but `"all"` is **refused**. A dimension is the time
+  axis when a same-named coordinate carries CF `"<step> since <ref>"` units, or
+  when it is literally named `time`.
+- **An axis count matching no array is an error**, never a silently ignored
+  selection.
+- **The decode is unchanged by the window** — CF `scale_factor`/`add_offset` in
+  float64, `_FillValue` → NaN, the time axis raw with `units`/`calendar`: a
+  windowed read must be **cell-for-cell identical to the full read sliced
+  afterwards**, which is exactly how the `era5-window-slice` case states it.
 
 ### Zarr decode notes (store-backed reader)
 

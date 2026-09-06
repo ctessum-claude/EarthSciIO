@@ -238,6 +238,48 @@ def build_era5_netcdf() -> tuple[bytes, dict, dict]:
     return data, expected, decode
 
 
+
+# -----------------------------------------------------------------------------
+# Fixture 1b — the SAME ERA5 blob read through a decode-time `select`
+# (transport=file, format=netcdf).
+#
+# A whole-file reader that honours an orthogonal selection still fetches one blob
+# under one cache key; only the requested hyperslab is materialised. The case
+# pins the two halves a windowed netCDF read can get wrong and zarr never could:
+# the array window itself, and the COORDINATES that must be sliced with it (the
+# zarr reader returns no coords, so this question has never been asked of the
+# corpus). The time axis stays "all" — record selection is the Provider's.
+# -----------------------------------------------------------------------------
+ERA5_WINDOW = {"axes": ["all", {"slice": [1, 3]}, {"indices": [0, 2]}]}
+
+
+def window_era5_expected(expected: dict) -> dict:
+    """Slice the full ERA5 expectation by ERA5_WINDOW — the oracle stated as
+    "the full read, sliced afterwards", which is exactly the acceptance gate."""
+    lat = [1, 2]      # {"slice": [1, 3]}
+    lon = [0, 2]      # {"indices": [0, 2]}
+    out_vars = {}
+    for name, spec in expected["variables"].items():
+        data = [[[slab[y][x] for x in lon] for y in lat] for slab in spec["data"]]
+        out_vars[name] = {
+            "dtype": spec["dtype"],
+            "dims": list(spec["dims"]),
+            "shape": [len(data), len(lat), len(lon)],
+            "fill_value": spec["fill_value"],
+            "data": data,
+        }
+    coords = expected["coords"]
+    out_coords = {
+        "latitude": {"dtype": coords["latitude"]["dtype"],
+                     "data": [coords["latitude"]["data"][y] for y in lat]},
+        "longitude": {"dtype": coords["longitude"]["dtype"],
+                      "data": [coords["longitude"]["data"][x] for x in lon]},
+        # the time axis is untouched: raw, with its units + calendar
+        "time": dict(coords["time"]),
+    }
+    return {"variables": out_vars, "coords": out_coords}
+
+
 # -----------------------------------------------------------------------------
 # Fixture 2 — OpenAQ-like CSV points slice (transport=file, format=csv).
 #
@@ -1255,6 +1297,26 @@ def main() -> None:
         notes=("ERA5-like 2x3x3 sub-tile. t2m is int16-packed (scale_factor/"
                "add_offset/_FillValue) -> decoded float64; one masked cell. sp "
                "is plain float64. Pins CF scale/offset/fill decode parity."),
+    ))
+
+    summary.append(("era5-window-slice",) + emit_case(
+        "era5-window-slice",
+        loader="era5", kind="grid", fmt="netcdf", transport="file", store="local",
+        resolved_url="https://data.earthsci.dev/era5/2018/11/20181108.nc",
+        ext="nc", data=nc_data,
+        expected=window_era5_expected(nc_expected),
+        decode=dict(nc_decode, decode_time_select=True),
+        select=ERA5_WINDOW,
+        notes=("The SAME blob and cache key as era5-grid-sub-tile, read through a "
+               "decode-time orthogonal `select`: lat {slice:[1,3]}, lon "
+               "{indices:[0,2]}, time \"all\". Pins that a whole-file reader "
+               "materialises only the hyperslab and returns arrays identical to "
+               "the full read sliced afterwards, that the lat/lon COORDINATES are "
+               "sliced with the data (a windowed variable beside a full-length "
+               "axis is the trap), that the masked cell still decodes to NaN "
+               "inside the window, and that the time axis is untouched and raw. "
+               "One blob, one sha256(url) key: a selection changes the decode, "
+               "never the fetch."),
     ))
 
     csv_data, csv_expected, csv_decode = build_openaq_csv()
