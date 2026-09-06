@@ -1389,6 +1389,8 @@ def main() -> None:
                "Deliberately carries NO nested column, ms-aligned timestamps "
                "only, and decimals inside Dec64's exact range — the three "
                "Parquet2.jl limits spec/conformance.md §3 records."),
+    ))
+
     tif_data, tif_expected, tif_decode = build_geotiff()
     summary.append(("landfire-raster-tile",) + emit_case(
         "landfire-raster-tile",
