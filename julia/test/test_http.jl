@@ -108,3 +108,100 @@ if lowercase(get(ENV, "EARTHSCI_LIVE", "")) in ("1", "true", "yes")
         @test fetch_blob(co, url).status == :hit
     end
 end
+
+# --- progress-earned timeout extension ---------------------------------------
+# A server that writes the body in slow pieces, so a transfer that is HEALTHY
+# but larger than the per-request cap is indistinguishable from a stall until
+# you look at whether bytes moved. Serves each connection more slowly than
+# EARTHSCIIO_HTTP_TIMEOUT allows on the first attempt.
+function _start_slow_server(payload::Vector{UInt8}, etag::AbstractString;
+                            pieces::Int = 4, pause::Float64 = 0.6)
+    server = listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    task = @async begin
+        try
+            while true
+                conn = accept(server)
+                @async try
+                    _read_http_request(conn)
+                    write(conn, "HTTP/1.1 200 OK\r\n",
+                          "Content-Length: $(length(payload))\r\n",
+                          "ETag: \"$etag\"\r\nConnection: close\r\n\r\n")
+                    n = cld(length(payload), pieces)
+                    for i in 1:pieces
+                        lo = (i - 1) * n + 1
+                        lo > length(payload) && break
+                        write(conn, @view payload[lo:min(lo + n - 1, length(payload))])
+                        flush(conn)
+                        sleep(pause)
+                    end
+                catch
+                finally
+                    close(conn)
+                end
+            end
+        catch
+        end
+    end
+    return server, port, task
+end
+
+@testset "http transport — a big-but-healthy transfer outgrows its cap" begin
+    payload = rand(UInt8, 64 * 1024)
+    server, port, _ = _start_slow_server(payload, "slow1"; pieces = 4, pause = 0.6)
+    dest = tempname()
+    try
+        # 1 s cap against a ~2.4 s body: the first attempt times out having
+        # moved bytes, which must buy a longer budget rather than a failure.
+        withenv("EARTHSCIIO_HTTP_TIMEOUT" => "1",
+                "EARTHSCIIO_HTTP_RETRIES" => "2",
+                "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
+            EarthSciIO._reset_http_downloader!()
+            r = EarthSciIO.fetch!(EarthSciIO.HttpTransport(),
+                                  "http://localhost:$port/slow.bin", dest)
+            @test r.status == :downloaded
+        end
+        @test read(dest) == payload
+    finally
+        close(server); rm(dest; force = true)
+        EarthSciIO._reset_http_downloader!()
+    end
+end
+
+@testset "http transport — a wedged transfer is still bounded" begin
+    # Accepts the connection, sends headers, then never sends the body: no
+    # progress is ever made, so no extension may be earned and the call must
+    # fail promptly rather than hanging for the extended budget.
+    server = listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    @async try
+        while true
+            conn = accept(server)
+            @async try
+                _read_http_request(conn)
+                write(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n",
+                      "Connection: close\r\n\r\n")
+                sleep(30)     # ... and nothing else
+            catch
+            finally
+                close(conn)
+            end
+        end
+    catch
+    end
+    dest = tempname()
+    try
+        t0 = time()
+        withenv("EARTHSCIIO_HTTP_TIMEOUT" => "1",
+                "EARTHSCIIO_HTTP_RETRIES" => "2",
+                "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
+            EarthSciIO._reset_http_downloader!()
+            @test_throws Exception EarthSciIO.fetch!(
+                EarthSciIO.HttpTransport(), "http://localhost:$port/wedged.bin", dest)
+        end
+        @test time() - t0 < 15    # 2 attempts x 1 s cap + backoff, not 6 extensions
+    finally
+        close(server); rm(dest; force = true)
+        EarthSciIO._reset_http_downloader!()
+    end
+end

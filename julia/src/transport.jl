@@ -87,9 +87,29 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
     lm === nothing || push!(headers, "If-Modified-Since" => lm)
 
     tries   = max(1, _http_env_int("EARTHSCIIO_HTTP_RETRIES", 5))
-    timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-request hard cap (s)
+    timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-request cap (s)
+    tmax    = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX", 7200))
+    base_timeout = timeout
+    # `timeout` is a TOTAL per-request cap, so on its own it also caps the SIZE
+    # of a blob this transport can fetch: at a realistic 40 MB/s the 90 s default
+    # gives up at ~3.5 GB, and single-file scientific archives are already past
+    # that (a 0.25 deg GEOS-FP A3dyn day is 3.80 GB). Raising the default instead
+    # would blunt what the cap is for -- the lost-wakeup deadlock, which must not
+    # be allowed to hang for the raised value.
+    #
+    # Distinguish the two by PROGRESS, which is exactly what separates them: a
+    # deadlocked or stalled transfer delivers no bytes, a healthy large one does.
+    # An attempt that timed out HAVING GROWN `dest` earns a bigger budget and is
+    # not charged a retry; one that timed out at a standstill is the failure the
+    # cap exists to bound, and it still dies in `timeout` seconds. The low-speed
+    # abort above (bytes/s floor, independently configurable) still catches the
+    # slow-trickle case that would otherwise extend forever.
+    extensions = 0
     local resp
-    for attempt in 1:tries
+    attempt = 0
+    while attempt < tries
+        attempt += 1
+        nbefore = isfile(dest) ? filesize(dest) : 0
         ok = false
         try
             resp = Downloads.request(url; method = "GET", output = dest,
@@ -109,7 +129,22 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
         end
         ok && break
         _reset_http_downloader!()   # rebuild the possibly-wedged multi-handle
-        if attempt == tries
+        # Progress-earned extension: this attempt moved bytes, so it is a large
+        # transfer outgrowing its budget, not a wedged one. Grow the cap and
+        # refund the attempt (bounded, so a pathologically slow server still
+        # terminates).
+        grew = (isfile(dest) ? filesize(dest) : 0) > nbefore
+        if grew && timeout < tmax && extensions < 6
+            timeout = min(timeout * 4, tmax)
+            extensions += 1
+            attempt -= 1
+            continue
+        end
+        # No progress: whatever this was, it is not a transfer outgrowing its
+        # budget, so hand the next attempt the ORIGINAL cap -- a wedge must never
+        # inherit an extension earned by an earlier, healthy attempt.
+        timeout = base_timeout
+        if attempt >= tries
             resp isa Exception && throw(resp)
             error("http transport: GET $url failed after $tries attempts: $resp")
         end
