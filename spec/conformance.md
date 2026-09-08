@@ -451,6 +451,24 @@ chunks out of the already-fetched blob. The reader therefore declares
   whose time axis is anything but `"all"` is **refused**. A dimension is the time
   axis when a same-named coordinate carries CF `"<step> since <ref>"` units, or
   when it is literally named `time`.
+- **`records` is how that axis IS narrowed** (Julia track today) — the refusal
+  above says the reader may not *choose* records, not that every record must be
+  decoded. `records = {dim: "<name>", indices: [<0-based>, …]}` is a second,
+  deliberately separate decode option through which the cadence owner states the
+  records it has already chosen, in the file's own numbering. The reader is told
+  the records, never the cadence: it does no `mod1`, knows nothing of the
+  cadence grid or `records_per_sample`, and materialises exactly the named
+  records of `dim` (and of `dim`'s own coordinate) **in the order given**.
+  Duplicates are legal — the end-of-data bracket `[last, last]` is one — and an
+  index outside `0:len-1`, a `dim` the blob lacks, an empty list, or a `select`
+  that narrows the same `dim` are all errors rather than a wrapped or widened
+  read. `dim_length(reader, path, dim)` (`registries.md` §2.3) is the metadata
+  read that lets an out-of-process caller compute those indices; in process
+  `indices` may instead be a `len -> indices` callable resolved inside the
+  decode's own open, so the cadence owner does not pay a second open per sample
+  (a blob with no such `dim` does not call it and narrows nothing). The gate is
+  the same as the window's: a record-selected read must be cell-for-cell
+  identical to the full read sliced afterwards.
 - **An axis count matching no array is an error**, never a silently ignored
   selection.
 - **The decode is unchanged by the window** — CF `scale_factor`/`add_offset` in

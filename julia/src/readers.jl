@@ -140,7 +140,30 @@ differently here. Applied thus:
   * a **dimension is never dropped** — a one-index axis comes back at length 1 —
     and an axis may legally select NOTHING (`Dict("indices"=>[])`, or an empty
     half-open `Dict("slice"=>[1, 1])`), giving a **zero-length axis** kept in
-    `dims` rather than an error."""
+    `dims` rather than an error.
+
+`records=Dict("dim"=>"time", "indices"=>[3,4])` is RECORD PUSHDOWN, the other
+half of the refused-time-axis rule above. `select` refuses a time axis because
+record selection belongs to whoever owns the cadence; `records` is how that owner — the
+[`Provider`], which has already turned a cadence tick into this file's own record
+index — says which records it wants, in the file's own 0-based numbering. The
+reader is told the records, never the cadence: it does no `mod1`, knows nothing
+of `times` or `records_per_sample`, and simply materialises the named records of
+`dim` (and of `dim`'s own coordinate) in the order given. Duplicates are legal —
+the end-of-data bracket `[last, last]` is one — and an index outside `0:len-1`,
+or a `dim` the blob does not have, is an error rather than a wrapped read.
+`records` and a `select` may be combined; they must not both name `dim`.
+
+`indices` may also be a CALLABLE `len -> indices`, evaluated against `dim`'s own
+length inside this reader's open. That is the in-process spelling only (the wire
+form is the list), and it exists for one measured reason: the record a cadence
+owner wants is a function of the file's length along `dim`, so with the list form
+alone the caller has to open the blob once to learn that length and the reader
+opens it again to read — and on a GEOS-FP A1 file that second open (16.9 ms)
+costs MORE than the records it saves (21.4 ms whole → 18.5 ms selected). With the
+callable there is exactly ONE open, and the `mod1` still runs in the caller's own
+closure. A blob with no `dim` at all does not call the resolver and makes no
+selection, which is what a caller that had probed would have found."""
 struct NetCDFReader <: Reader end
 
 # Widened capability (spec/registries.md §2): "honours `select` without
@@ -148,6 +171,18 @@ struct NetCDFReader <: Reader end
 # separates a fetch-scoped selection — the zarr reader's, which shrinks the
 # DOWNLOAD — from this decode-scoped one, which shrinks only the decode.
 supports_selection(::NetCDFReader) = true
+
+# Metadata-only dimension length (`spec/registries.md` §2.3): netCDF dimension
+# lengths live in the file's header, so this opens the blob and reads no array at
+# all. It is what lets an OUT-OF-PROCESS caller compute a record index before the
+# decode it wants to narrow; in process the `records` option's callable form does
+# the same job inside the decode's own open (see `records` above).
+function dim_length(::NetCDFReader, path::AbstractString, dim::AbstractString)
+    d = String(dim)
+    return NCDatasets.NCDataset(String(path), "r") do ds
+        haskey(ds.dim, d) ? Int(ds.dim[d]) : nothing
+    end
+end
 
 # A CF time axis is one whose `units` is "<step> since <reference>" (hours since
 # …, days since …). Matching xarray `decode_times=false`, such variables are
@@ -396,6 +431,47 @@ function _netcdf_dim_selection(ds, select)
     return isempty(out) ? nothing : out
 end
 
+# Fold a `records` pushdown into the dimension→indices map `sel` built from
+# `select`. The two vocabularies meet here on purpose: a record selection IS a
+# one-axis index list, so it rides the same hyperslab/gather machinery below and
+# cannot decode differently from a spatial window. What differs is only WHO may
+# ask — hence the separate keyword and the explicit `dim`.
+function _netcdf_merge_records(ds, sel, records)
+    records === nothing && return sel
+    haskey(records, "dim") && haskey(records, "indices") || throw(ArgumentError(
+        "records must be a Dict with \"dim\" and \"indices\", got keys " *
+        "$(sort!(String[String(k) for k in keys(records)]))"))
+    d = String(records["dim"])
+    want = records["indices"]
+    if !haskey(ds.dim, d)
+        # A CALLABLE `indices` delegates the axis length to this open, so "there is
+        # no such axis" is an answer it is entitled to receive: the resolver is not
+        # called and no selection is made, which is exactly what the caller would
+        # have done had it probed and found nothing. A LITERAL list was written
+        # against an axis the blob does not have, and that is a mistake.
+        want isa Union{Function,Base.Callable} && return sel
+        throw(ArgumentError(
+            "records names dimension '$d', which the blob does not have; present: " *
+            "$(sort!(String[String(k) for k in keys(ds.dim)]))"))
+    end
+    len = Int(ds.dim[d])
+    idxs = Int[Int(i) for i in (want isa Union{Function,Base.Callable} ? want(len) : want)]
+    isempty(idxs) && throw(ArgumentError(
+        "records asks for no records of '$d'; an empty selection is an error, " *
+        "not a whole-axis read"))
+    bad = sort!(unique(Int[i for i in idxs if i < 0 || i >= len]))
+    isempty(bad) || throw(ArgumentError(
+        "records index/indices $bad are outside 0:$(len - 1) for dimension '$d' " *
+        "(the reader does not wrap: locating a cadence tick inside its file is " *
+        "the Provider's job)"))
+    out = sel === nothing ? Dict{String,Vector{Int}}() : sel
+    haskey(out, d) && throw(ArgumentError(
+        "select and records both narrow dimension '$d'; a record selection is " *
+        "the Provider's and a `select` must leave the record axis \"all\""))
+    out[d] = idxs
+    return out
+end
+
 # An ordered index list as (start, step, needs_gather): an arithmetic progression
 # reads as ONE strided hyperslab; anything else (a permuted or irregular list)
 # reads its bounding slab and gathers out of it — still never the whole array.
@@ -452,7 +528,7 @@ function _netcdf_read(v, file_dims::Vector{String}, sel, raw::Bool)
 end
 
 function read_native(::NetCDFReader, path::AbstractString; variables = nothing,
-                     select = nothing)
+                     select = nothing, records = nothing)
     nds = NativeDataset()
     NCDatasets.NCDataset(String(path), "r") do ds
         dimset = Set(String.(collect(keys(ds.dim))))
@@ -468,6 +544,11 @@ function read_native(::NetCDFReader, path::AbstractString; variables = nothing,
         # chunks). Resolved ONCE, per dimension name, so the coordinate fields are
         # sliced with the data they index rather than left at full length.
         sel = _netcdf_dim_selection(ds, select)
+        # RECORD PUSHDOWN: the cadence owner's chosen records of its own axis,
+        # folded into the same map. Without it the record axis comes back whole
+        # and the caller slices it afterwards — every record decoded to keep one
+        # or two.
+        sel = _netcdf_merge_records(ds, sel, records)
         for vn in keys(ds)
             name = String(vn)
             # Coordinates are always kept; data variables honour the projection.

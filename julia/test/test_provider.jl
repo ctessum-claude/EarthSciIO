@@ -6,6 +6,56 @@
 # (materialize/refresh/refresh_times/prefetch). Reuses the corpus comparison
 # helpers from test_readers.jl (included first by runtests.jl).
 
+# A reader that wraps the real netcdf one and RECORDS what the Provider pushed
+# down. It is how the record-pushdown testset below asserts the other half of the
+# contract: not just that the bracket is unchanged, but that the Provider asked
+# for exactly the records it needed — file-local and 0-based — in each of the four
+# bracket cases. (Top level, because a struct and its methods cannot be defined
+# inside a `@testset begin` block.)
+struct RecordSpyReader <: EarthSciIO.Reader end
+const RECORDS_PUSHED = Vector{Any}()
+function EarthSciIO.read_native(::RecordSpyReader, path::AbstractString;
+                                variables = nothing, select = nothing, records = nothing)
+    # Record the RESOLVED list. The Provider pushes `indices` as a
+    # `len -> indices` callable (so the axis length costs no second open), so
+    # resolve it here against the same length the real reader will use — that is
+    # what makes the assertions below read as the record numbers they are.
+    if records !== nothing
+        d = String(records["dim"])
+        want = records["indices"]
+        len = dim_length(FORMAT_REGISTRY["netcdf"], path, d)
+        push!(RECORDS_PUSHED,
+              Dict{String,Any}("dim" => d,
+                               "indices" => want isa Base.Callable ?
+                                            Int[Int(i) for i in want(len)] :
+                                            Int[Int(i) for i in want]))
+    else
+        push!(RECORDS_PUSHED, records)
+    end
+    return read_native(FORMAT_REGISTRY["netcdf"], path; variables = variables,
+                       select = select, records = records)
+end
+EarthSciIO.dim_length(::RecordSpyReader, path::AbstractString, dim::AbstractString) =
+    dim_length(FORMAT_REGISTRY["netcdf"], path, dim)
+register!(FORMAT_REGISTRY, "netcdf-recordspy", RecordSpyReader())
+
+# Field-for-field BYTE equality of two decoded datasets — names, dims, attrs,
+# eltypes and the bit patterns themselves. `≈` would hide a NaN that moved cell,
+# and a Float32 that reached Float64 by a different route.
+function same_native(a, b)
+    variable_names(a) == variable_names(b) || return false
+    coord_names(a) == coord_names(b) || return false
+    for n in vcat(variable_names(a), coord_names(a))
+        a[n].dims == b[n].dims || return false
+        a[n].attrs == b[n].attrs || return false
+        size(a[n].data) == size(b[n].data) || return false
+        eltype(a[n].data) == eltype(b[n].data) || return false
+        reinterpret(UInt8, vec(collect(a[n].data))) ==
+            reinterpret(UInt8, vec(collect(b[n].data))) || return false
+    end
+    return true
+end
+
 @testset "cadence Provider — materialize/refresh/refresh_times/prefetch (offline)" begin
     store = LocalStore(joinpath(CORPUS, "cache"))
     cache = Cache(store; offline = true, verify = true)
@@ -132,6 +182,104 @@
         end
     end
 
+    @testset "record pushdown: the Provider narrows the decode, not the result" begin
+        # The Provider owns the cadence, so it — not the reader — decides which
+        # records it wants; what it pushes down is an absolute, file-local, 0-based
+        # record list. Asserted in both directions: the right list reaches the
+        # reader in each of the four bracket cases, AND the dataset that comes back
+        # is byte-for-byte what decoding the whole record axis and slicing
+        # afterwards produced.
+        #
+        # Two "days" of the 2-record era5 fixture under two URLs, so the cadence
+        # genuinely crosses a file seam (record values repeat per file:
+        # record 1 = 282.5, record 2 = 282.6).
+        day1, day2 = era5, "https://data.earthsci.dev/era5/2018/11/20181110.nc"
+        root = mktempdir()
+        src = joinpath(CORPUS, "cache", "v1", "blobs", cache_key(era5)[1:2],
+                       cache_key(era5) * ".nc")
+        for u in (day1, day2)
+            k = cache_key(u)
+            d = joinpath(root, "v1", "blobs", k[1:2]); mkpath(d)
+            cp(src, joinpath(d, k * ".nc"))
+        end
+        # verify=false: the copies carry no manifest to check the digest against.
+        two = Cache(LocalStore(root); offline = true, verify = false)
+        urls = t -> t < 2.0 ? day1 : day2
+        times = [0.0, 1.0, 2.0, 3.0]          # 4 ticks over 2 files of 2 records
+
+        # The reference side bakes `records = nothing`, which is exactly the
+        # historical path: the Provider leaves the pushdown alone when the caller
+        # has spelled a `records` of its own, and the reader then reads the record
+        # axis whole and the Provider slices afterwards.
+        mkspy(rps) = discrete_provider(two, urls, times; format = "netcdf-recordspy",
+                                       time_dim = "time", records_per_sample = rps)
+        mkref(rps) = discrete_provider(two, urls, times; format = "netcdf",
+                                       time_dim = "time", records_per_sample = rps,
+                                       reader_kwargs = (records = nothing,))
+        rec(idxs) = Dict{String,Any}("dim" => "time", "indices" => idxs)
+        spy2, ref2 = mkspy(2), mkref(2)
+        spy1, ref1 = mkspy(1), mkref(1)
+
+        @testset "interior bracket: both records, ONE decode of one file" begin
+            empty!(RECORDS_PUSHED)
+            b = refresh(spy2, 0.0)                  # file 1, records 1+2
+            @test RECORDS_PUSHED == [rec([0, 1])]   # one decode covers the pair
+            @test same_native(b, refresh(ref2, 0.0))
+            @test b["t2m"].data[1, 1, 1] ≈ 282.5
+            @test b["t2m"].data[2, 1, 1] ≈ 282.6
+        end
+
+        @testset "cross-file successor: one record out of each file" begin
+            empty!(RECORDS_PUSHED)
+            b = refresh(spy2, 1.0)                  # file 1 rec 2 -> file 2 rec 1
+            @test RECORDS_PUSHED == [rec([1]), rec([0])]
+            @test same_native(b, refresh(ref2, 1.0))
+            @test b["t2m"].data[1, 1, 1] ≈ 282.6
+            @test b["t2m"].data[2, 1, 1] ≈ 282.5
+        end
+
+        @testset "end of data: the degenerate [last, last] never throws" begin
+            empty!(RECORDS_PUSHED)
+            b = refresh(spy2, 3.0)                  # last tick: there is no successor
+            # ONE record is read and stacked with itself; nothing may be asked of a
+            # file past the end of the cadence.
+            @test RECORDS_PUSHED == [rec([1])]
+            @test same_native(b, refresh(ref2, 3.0))
+            @test b["t2m"].data[1, 1, 1] == b["t2m"].data[2, 1, 1]
+            @test b["time"].data[1] == b["time"].data[2]
+            empty!(RECORDS_PUSHED)
+            past = materialize(spy2, 9.0)           # past the end clamps the same way
+            @test RECORDS_PUSHED == [rec([1])]
+            @test same_native(past, materialize(ref2, 9.0))
+        end
+
+        @testset "records_per_sample=1: one record, time_dim dropped" begin
+            empty!(RECORDS_PUSHED)
+            s = refresh(spy1, 2.0)                  # file 2, record 1
+            @test RECORDS_PUSHED == [rec([0])]
+            @test !haskey(s, "time")                # the record axis is dropped
+            @test s["t2m"].dims == ["latitude", "longitude"]
+            @test same_native(s, refresh(ref1, 2.0))
+            @test s["t2m"].data[1, 1] ≈ 282.5
+            empty!(RECORDS_PUSHED)
+            @test same_native(refresh(spy1, 3.0), refresh(ref1, 3.0))
+            @test RECORDS_PUSHED == [rec([1])]
+        end
+
+        @testset "the pushdown is opt-in, per reader" begin
+            # The `csv` reader declares no `records` option, so nothing is pushed
+            # and the Provider must not try — this is what keeps the change
+            # additive for every other format.
+            @test !(:records in reader_option_keys(FORMAT_REGISTRY["csv"]))
+            @test :records in reader_option_keys(FORMAT_REGISTRY["netcdf"])
+            @test EarthSciIO._records_pushdown(discrete_provider(two, urls, times;
+                format = "netcdf", time_dim = "time", records_per_sample = 2))
+            @test !EarthSciIO._records_pushdown(mkref(2))          # a baked one wins
+            @test !EarthSciIO._records_pushdown(discrete_provider(two, urls, times;
+                format = "netcdf", records_per_sample = nothing))  # no time_dim
+        end
+    end
+
     @testset "multi-file cadence: the record is located inside its OWN file" begin
         # A cadence that spans several files is the ordinary case for a long run
         # (GEOS-FP publishes one file per day; a week is seven of them). The
@@ -237,7 +385,8 @@
         @test :member_glob in reader_option_keys(FF10Reader())
         @test :skip_header_row in reader_option_keys(FF10Reader())
         @test Set(reader_option_keys(ZarrReader())) == Set([:variables, :select])
-        @test Set(reader_option_keys(NetCDFReader())) == Set([:variables, :select])
+        # netcdf takes a third: `records`, the cadence owner's record pushdown
+        @test Set(reader_option_keys(NetCDFReader())) == Set([:variables, :select, :records])
 
         # ...and an option outside that set fails the Provider, naming it.
         e = try

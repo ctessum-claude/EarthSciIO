@@ -170,7 +170,7 @@ _reader_for(p::Provider) = FORMAT_REGISTRY[p.format]
 # by materialising only the requested hyperslab of the blob it already fetched.
 # A `select` handed to a reader that does neither is a clear error, raised BEFORE
 # any fetch (the fetch-full fallback belongs to the EarthSciAST caller, not here).
-function _load(p::Provider, t; select = nothing)
+function _load(p::Provider, t; select = nothing, records = nothing)
     reader = _reader_for(p)
     # Store-backed readers (e.g. zarr) are handed (cache, base_url; variables,
     # select): a Zarr `url` is a directory-like prefix, not a fetchable blob, so
@@ -180,6 +180,9 @@ function _load(p::Provider, t; select = nothing)
         # Effective select: a per-call `select` OVERRIDES the baked
         # reader_kwargs[:select]. Forward it explicitly and splat the REST of
         # reader_kwargs (with `:select` removed, so `select` is never passed twice).
+        records === nothing || throw(ArgumentError(
+            "a store-backed reader takes its record selection through `select`, " *
+            "not `records`"))
         effective = select === nothing ? get(p.reader_kwargs, :select, nothing) : select
         rest = Dict{Symbol,Any}(k => v for (k, v) in p.reader_kwargs if k !== :select)
         return read_store(reader, p.cache, p.url_for(t);
@@ -219,6 +222,11 @@ function _load(p::Provider, t; select = nothing)
             kw[:variables] = wanted
         end
     end
+    # RECORD PUSHDOWN (`_load_ticks`): the records this file must yield, already
+    # resolved to the file's own 0-based numbering by the caller — the cadence
+    # never reaches the reader. Only set on the pushdown path, which has already
+    # checked the reader declares the option.
+    records === nothing || (kw[:records] = records)
     nds = read_native(reader, entry.path; kw...)
     return wanted === nothing ? nds : _select(nds, wanted)
 end
@@ -292,6 +300,65 @@ end
 # there is no wrap to apply and the tick passes through (the caller's slice then
 # reports the real out-of-range error rather than a silently wrong record).
 _file_record(tick::Integer, len::Integer) = len <= 0 ? Int(tick) : mod1(Int(tick), Int(len))
+
+# --- record pushdown --------------------------------------------------------
+# Can this provider hand its record CHOICE to the reader, instead of decoding the
+# whole cadence axis and slicing afterwards? Three things must hold: the reader
+# declares a `records` decode option (the same `reader_option_keys` rule the
+# `variables` projection uses), the caller has not baked a `records` of its own
+# into `reader_kwargs`, and the source is a whole-file blob — a store-backed
+# reader narrows records through `select`, whose chunk arithmetic already shrinks
+# the FETCH, and must not be handed a second, conflicting mechanism.
+function _records_pushdown(p::Provider)
+    p.time_dim === nothing && return false
+    reader = _reader_for(p)
+    store_backed(reader) && return false
+    haskey(p.reader_kwargs, :records) && return false
+    opts = reader_option_keys(reader)
+    return opts !== nothing && :records in opts
+end
+
+# Decode the file holding cadence tick `ticks[1]`, keeping ONLY the records those
+# ticks name, and return `(nds, positions)` — `positions[k]` is where `ticks[k]`
+# sits along `time_dim` in `nds`.
+#
+# Every tick in `ticks` must land in the SAME file; the caller checks that by URL
+# before asking. The cadence→record arithmetic (`_file_record`, i.e. `mod1` over
+# the file's own length) stays HERE, on the side that owns the cadence: the
+# reader is handed absolute 0-based record indices and never learns of `times`,
+# `records_per_sample` or a file boundary. That is why the length has to be read
+# from metadata first — a record cannot be chosen before the decode without it.
+#
+# A reader that takes no `records` option falls back to the historical path:
+# decode the axis whole, return the record indices to slice at. The two paths
+# differ in what is DECODED and in nothing else.
+function _load_ticks(p::Provider, ticks::AbstractVector{<:Integer}; select = nothing)
+    dim = p.time_dim::String
+    t_url = p.times[first(ticks)]
+    if !_records_pushdown(p)
+        nds = _load(p, t_url; select = select)
+        len = _time_len(nds, dim)
+        return (nds, Int[_file_record(tk, len) for tk in ticks])
+    end
+    # The record a tick names is `mod1(tick, len)`, so the pushdown needs the
+    # file's length along `dim` — which only the decode's own open knows. Rather
+    # than open the blob twice (measured: on a GEOS-FP A1 file the extra open
+    # costs more than the records it saves), hand the reader THIS CLOSURE: it is
+    # called with `len` inside the reader's single open, and the cadence
+    # arithmetic still happens here, in the Provider, exactly as before.
+    fired = Ref(false)
+    resolve = function (len::Integer)
+        fired[] = true
+        return Int[_file_record(tk, Int(len)) - 1 for tk in ticks]   # 0-based
+    end
+    nds = _load(p, t_url; select = select,
+                records = Dict{String,Any}("dim" => dim, "indices" => resolve))
+    # The resolver is not called when the blob has no such dimension. That is the
+    # `len <= 0` case of `_file_record`, and it must behave exactly as it always
+    # did: nothing was narrowed, so the tick passes through to the slice.
+    fired[] && return (nds, collect(1:length(ticks)))
+    return (nds, Int[_file_record(tk, _time_len(nds, dim)) for tk in ticks])
+end
 
 # Slice `dim` out of every variable that carries it, at record `idx`; drop the
 # now-singular dimension and its coordinate. Used for an internal-axis DISCRETE
@@ -425,24 +492,31 @@ function _bracket(p::Provider, t::Real; select = nothing)
     # are about to slice is the tick's, so it must come from the tick's file. The
     # two agree for any resolver that is constant across a file's own span, but
     # only the tick time is guaranteed to name the file that holds the record.
-    u0   = p.url_for(p.times[tick])
-    nds0 = _load(p, p.times[tick]; select = select)
+    u0 = p.url_for(p.times[tick])
+    last_tick = tick >= length(p.times)      # no successor → degenerate bracket
+    same_file = !last_tick && p.url_for(p.times[tick + 1]) == u0
+    # ONE read covers the same-file bracket: both records come out of the same
+    # decode, and with a `records` pushdown that decode materialises those two
+    # records and no others. The end-of-data and cross-file cases ask this file
+    # for the floor record alone — the successor is either absent (it degenerates
+    # to the floor) or in the next file, read below.
+    ticks0 = same_file ? Int[tick, tick + 1] : Int[tick]
+    nds0, pos0 = _load_ticks(p, ticks0; select = select)
     scale = _cf_time_scale(_time_units(nds0, dim))
-    L0 = _time_len(nds0, dim)
-    i0 = _file_record(tick, L0)              # ... and its record inside that file
     t0 = _raw_to_epoch(p.times[tick], scale)
 
-    if tick >= length(p.times)               # last tick / past end → degenerate
-        return _bracket_build(nds0, i0, nds0, i0, dim, t0, t0)
+    if last_tick                             # last tick / past end → degenerate
+        return _bracket_build(nds0, pos0[1], nds0, pos0[1], dim, t0, t0)
     end
 
     t1 = _raw_to_epoch(p.times[tick + 1], scale)
-    if p.url_for(p.times[tick + 1]) == u0    # successor in the same file
-        return _bracket_build(nds0, i0, nds0, _file_record(tick + 1, L0), dim, t0, t1)
+    if same_file                             # successor in the same file
+        return _bracket_build(nds0, pos0[1], nds0, pos0[2], dim, t0, t1)
     end
-    nds1 = _load(p, p.times[tick + 1]; select = select)   # successor: the next file
-    return _bracket_build(nds0, i0, nds1,
-                          _file_record(tick + 1, _time_len(nds1, dim)), dim, t0, t1)
+    # Successor: record 1 of the NEXT file, re-decoded because the provider keeps
+    # no file buffer (and, with the pushdown, one record of it rather than all).
+    nds1, pos1 = _load_ticks(p, Int[tick + 1]; select = select)
+    return _bracket_build(nds0, pos0[1], nds1, pos1[1], dim, t0, t1)
 end
 
 """
@@ -471,8 +545,10 @@ function materialize(p::Provider, t::Real; select = nothing)
     end
     if p.time_dim !== nothing
         tick = _tick_index(p, t)
-        nds = _load(p, p.times[tick]; select = select)     # the TICK's file (see _bracket)
-        return _slice_dim(nds, p.time_dim, _file_record(tick, _time_len(nds, p.time_dim)))
+        # The TICK's file (see `_bracket`), and — where the reader takes a
+        # `records` pushdown — only the tick's record out of it.
+        nds, pos = _load_ticks(p, Int[tick]; select = select)
+        return _slice_dim(nds, p.time_dim, pos[1])
     end
     return _load(p, t; select = select)
 end

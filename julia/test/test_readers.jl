@@ -577,6 +577,103 @@ end
     end
 end
 
+@testset "netcdf reader — `records` pushdown (the cadence owner's record axis)" begin
+    era5_case = JSON.parsefile(joinpath(CORPUS, "cases", "era5-grid-sub-tile.json"))
+    blob = joinpath(CORPUS, era5_case["blob_path"])
+    reader = FORMAT_REGISTRY["netcdf"]
+    full = read_native(reader, blob)                       # 2 records (hours 0, 1)
+
+    # `dim_length` is the metadata-only half of the pushdown: the record index a
+    # Provider wants is `mod1(tick, len)`, so `len` has to be knowable BEFORE the
+    # decode it is meant to narrow. It reads the header, never an array.
+    @test dim_length(reader, blob, "time") == 2
+    @test dim_length(reader, blob, "latitude") == 3
+    @test dim_length(reader, blob, "no-such-dim") === nothing
+    # every other reader inherits "I cannot answer that"
+    @test dim_length(FORMAT_REGISTRY["csv"], blob, "time") === nothing
+    # ...and it is declared, so the Provider knows it may push records down
+    @test :records in reader_option_keys(reader)
+
+    # The acceptance gate: a record-selected read equals the FULL read sliced
+    # afterwards, cell for cell, with dims/attrs untouched and the record axis
+    # RETAINED at the requested length.
+    one = read_native(reader, blob; records = Dict("dim" => "time", "indices" => [1]))
+    for name in ("t2m", "sp")
+        @test isequal(one[name].data, full[name].data[2:2, :, :])
+        @test one[name].dims == full[name].dims            # dims are NAMES, not lengths
+        @test one[name].attrs == full[name].attrs
+    end
+    # the record axis's own coordinate is sliced WITH the data, raw, attrs kept
+    @test one["time"].data == full["time"].data[2:2]
+    @test eltype(one["time"].data) == eltype(full["time"].data)
+    @test one["time"].attrs == full["time"].attrs
+    @test one["latitude"].data == full["latitude"].data    # untouched axes stay whole
+
+    # Order is the order given, and DUPLICATES are legal — the end-of-data bracket
+    # [last, last] is exactly a duplicate pair, and a reader that de-duplicated or
+    # sorted would silently hand back one record where two were asked for.
+    rev = read_native(reader, blob; records = Dict("dim" => "time", "indices" => [1, 0]))
+    @test isequal(rev["t2m"].data, full["t2m"].data[[2, 1], :, :])
+    dup = read_native(reader, blob; records = Dict("dim" => "time", "indices" => [1, 1]))
+    @test size(dup["t2m"].data, 1) == 2
+    @test isequal(dup["t2m"].data, full["t2m"].data[[2, 2], :, :])
+    @test dup["time"].data == full["time"].data[[2, 2]]
+
+    # `variables`, `select` and `records` all compose: project, window, then records.
+    sel = Dict("axes" => Any["all", Dict("slice" => [1, 3]), Dict("indices" => [0, 2])])
+    all3 = read_native(reader, blob; variables = ["t2m"], select = sel,
+                       records = Dict("dim" => "time", "indices" => [1]))
+    @test variable_names(all3) == ["t2m"]
+    @test isequal(all3["t2m"].data, full["t2m"].data[2:2, 2:3, [1, 3]])
+    @test all3["latitude"].data == full["latitude"].data[2:3]
+    @test all3["time"].data == full["time"].data[2:2]
+
+    # The reader is told the RECORDS, never the cadence: it does no wrapping, so an
+    # out-of-range index is an error rather than a silently `mod1`'d record.
+    for bad in ([2], [-1], [0, 2])
+        e = try
+            read_native(reader, blob; records = Dict("dim" => "time", "indices" => bad))
+            nothing
+        catch err
+            err
+        end
+        @test e isa ArgumentError
+        @test occursin("outside 0:1", sprint(showerror, e))
+    end
+    # a dimension the blob does not have, an empty selection, and a malformed shape
+    @test_throws ArgumentError read_native(reader, blob;
+        records = Dict("dim" => "nope", "indices" => [0]))
+    @test_throws ArgumentError read_native(reader, blob;
+        records = Dict("dim" => "time", "indices" => Int[]))
+    @test_throws ArgumentError read_native(reader, blob; records = Dict("dim" => "time"))
+    # `select` and `records` may not both narrow the same axis
+    @test_throws ArgumentError read_native(reader, blob;
+        select = Dict("axes" => Any["all", Dict("slice" => [1, 3]), "all"]),
+        records = Dict("dim" => "latitude", "indices" => [0]))
+
+    # The CALLABLE `indices`: resolved against the axis length inside this
+    # reader's own open, so a caller whose record choice depends on that length
+    # (`mod1(tick, len)`) does not have to open the blob a second time to learn
+    # it. Same answer as the equivalent literal list.
+    seen = Int[]
+    cb = read_native(reader, blob; records = Dict("dim" => "time",
+        "indices" => len -> (push!(seen, len); [len - 1])))
+    @test seen == [2]                                  # told the real axis length
+    @test isequal(cb["t2m"].data, full["t2m"].data[2:2, :, :])
+    @test cb["time"].data == full["time"].data[2:2]
+    # a resolver that returns something out of range is checked like any other list
+    @test_throws ArgumentError read_native(reader, blob;
+        records = Dict("dim" => "time", "indices" => len -> [len]))
+    # a blob with no such dimension does NOT call the resolver and narrows
+    # nothing — the answer a caller that had probed with `dim_length` would give
+    # itself — while a LITERAL list against a missing dimension stays an error.
+    called = Ref(false)
+    absent = read_native(reader, blob; records = Dict("dim" => "no-such-dim",
+        "indices" => len -> (called[] = true; Int[])))
+    @test !called[]
+    @test isequal(absent["t2m"].data, full["t2m"].data)
+end
+
 @testset "reader edge cases" begin
     # zarr is now active + store-backed: read_store requires an explicit variable
     # list (the store cannot be enumerated without a consolidated .zmetadata).

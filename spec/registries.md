@@ -112,7 +112,7 @@ header handling are decode-side).
 
 | name | ext | status | notes |
 |---|---|---|---|
-| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present. **`select` is honoured at DECODE time**: the same blob is fetched under the same cache key and only the requested hyperslab is materialised, so `supports_selection` is true while `store_backed` stays false. Axes are the shared 0-based vocabulary (`"all"`/`{indices}`/`{slice}`), positional over file-order dims of the **decoded fields** whose rank matches, then applied by dimension NAME to every array **and every coordinate**; a time axis that is not `"all"` is refused (record selection is the Provider's). **TEXT variables are `string` fields in every track** (a `char` array, a NetCDF-4 `NC_STRING`), never skipped by any of them: a `char` variable's last dimension is the string LENGTH exactly when nothing else claims it as an axis, so `char label(n, strlen)` is n NUL-stripped strings and a 1-D `char label(strlen)` on a private dimension is a scalar string, while `char label(n)` beside a `float value(n)` stays n one-character strings. A consumed string length is not an axis: it never enters the positional rank match (`char label(n, strlen)` is RANK 1) and a selection naming one is an error, not a silent truncation of every string. See [conformance.md](conformance.md#decode) "NetCDF decode notes" |
+| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present. **`select` is honoured at DECODE time**: the same blob is fetched under the same cache key and only the requested hyperslab is materialised, so `supports_selection` is true while `store_backed` stays false. Axes are the shared 0-based vocabulary (`"all"`/`{indices}`/`{slice}`), positional over file-order dims of the **decoded fields** whose rank matches, then applied by dimension NAME to every array **and every coordinate**; a time axis that is not `"all"` is refused (record selection is the Provider's). **TEXT variables are `string` fields in every track** (a `char` array, a NetCDF-4 `NC_STRING`), never skipped by any of them: a `char` variable's last dimension is the string LENGTH exactly when nothing else claims it as an axis, so `char label(n, strlen)` is n NUL-stripped strings and a 1-D `char label(strlen)` on a private dimension is a scalar string, while `char label(n)` beside a `float value(n)` stays n one-character strings. A consumed string length is not an axis: it never enters the positional rank match (`char label(n, strlen)` is RANK 1) and a selection naming one is an error, not a silent truncation of every string. **`records = {dim, indices}` is how the Provider then pushes the records it chose** (Julia track today): absolute, file-local, 0-based, honoured in the order given, duplicates legal, out-of-range an error — the reader is told the records and never the cadence. `dim_length` (§2.3) is the metadata read that makes those indices computable before the decode. See [conformance.md](conformance.md#decode) "NetCDF decode notes" |
 | `geotiff` | `tif`,`tiff` | **active** | raster bands via GDAL; Py first, Jl/Rs may lag (R5) |
 | `csv` | `csv` | **active** | points: numeric cols → float64, others → string |
 | `json` | `json` | **active** | points (e.g. station-discovery payloads) |
@@ -152,6 +152,28 @@ The native array is keyed by the **on-disk** variable name.
 
 Format is selected by the loader's declared format (or a content-type /
 extension sniff), **never** by trusting the cache-blob suffix alone.
+
+### 2.3 Metadata shape queries (`array_shape` / `dim_length`)
+
+A caller decides WHAT to ask for before paying to decode anything, so both
+reader families expose a metadata-only shape query:
+
+| query | reader family | reads | answers |
+|---|---|---|---|
+| `array_shape(reader, cache, base_url, var)` | store-backed (`zarr`) | the array's `.zarray`, never a chunk | the full native shape of one array |
+| `dim_length(reader, path, dim)` | whole-file (`netcdf`) | the blob's header, never an array | the length of one dimension |
+
+Both default to "cannot answer" (`nothing`/`None`) for a reader that does not
+implement them, and a caller must treat that as "read whole and slice on my own
+side" rather than as an error. `dim_length` is what makes a `records` pushdown
+(`conformance.md`, "NetCDF decode notes") expressible out of process at all: the
+records a cadence owner wants are `mod1(tick, len)` of the file's own record axis,
+so `len` has to be known before the decode that the selection is meant to narrow.
+In process, that costs a second open of the blob — **measured at 16.9 ms on a
+GEOS-FP A1 file against the 2.9 ms the record selection saves there** — which is
+why the `records` option also accepts a `len -> indices` callable resolved inside
+the decode's own open, and why the Provider uses that form.
+
 
 ---
 

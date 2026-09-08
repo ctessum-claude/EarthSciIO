@@ -179,6 +179,29 @@ function reader_option_keys(reader)
     return decl
 end
 
+"""
+    dim_length(reader, path, dim) -> Union{Nothing,Int}
+
+The length of dimension `dim` in the blob at `path`, read from the file's
+METADATA — the header, never an array. `nothing` when the reader cannot answer
+(the default, and what every reader inherits) or when the blob has no such
+dimension.
+
+This is the whole-file counterpart of [`array_shape`], which answers the same
+question for a store-backed reader from its `.zarray` metadata. Both exist so a
+caller can decide WHAT to ask for before paying to decode anything — a record
+selection to push into a `netcdf` decode is a function of the file's length along
+the record axis, and this is how an out-of-process caller learns it without
+decoding an array.
+
+[`Provider`] does not use it: pushing a record selection down needs that length on
+every sample, and a second open of the blob costs more than the records it saves
+on a variable-rich file, so the Provider hands the reader a `len -> indices`
+CALLABLE that is resolved inside the decode's own open instead
+(`records`, [`NetCDFReader`]).
+"""
+dim_length(::Any, ::AbstractString, ::AbstractString) = nothing
+
 """A registered-but-unimplemented reader (e.g. the `zarr` stub). Calling it is a
 clear error pointing at the bead that will implement it."""
 struct StubReader
