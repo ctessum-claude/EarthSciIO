@@ -28,6 +28,20 @@ use std::path::PathBuf;
 use earthsciio::transport::{S3Transport, Transport};
 use earthsciio::transport::Conditional;
 
+/// Serializes the tests in this file.
+///
+/// `S3Transport::new()` reads the process environment, and one test here *sets*
+/// `EARTHSCI_S3_BUCKET_OPTIONS` — so without this, that test decides whether the
+/// tests asserting "nothing is signed by default" see a named bucket. Every test
+/// takes it, including the offline ones, because which of them run together is
+/// not something a test may assume.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV_LOCK`], surviving a previous test's panic.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A staging path on a throwaway directory, as the cache would hand a transport.
 fn staging() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -43,6 +57,7 @@ fn staging() -> (tempfile::TempDir, PathBuf) {
 /// environment is carrying, an unnamed bucket must not be signed.
 #[test]
 fn nothing_signs_unless_a_bucket_is_named() {
+    let _lock = env_lock();
     let t = S3Transport::new();
     assert!(
         !t.signs("inmap-model"),
@@ -64,6 +79,7 @@ fn nothing_signs_unless_a_bucket_is_named() {
 /// public object that suddenly needs credentials.
 #[test]
 fn a_public_bucket_still_reads_anonymously() {
+    let _lock = env_lock();
     if std::env::var("EARTHSCI_S3_ONLINE_TEST").is_err() {
         eprintln!("set EARTHSCI_S3_ONLINE_TEST=1 to run the live public read");
         return;
@@ -88,6 +104,7 @@ fn a_public_bucket_still_reads_anonymously() {
 /// object really is private and that signing is what changed the answer.
 #[test]
 fn a_named_private_bucket_reads_signed() {
+    let _lock = env_lock();
     let Ok(url) = std::env::var("EARTHSCI_S3_SIGNED_TEST") else {
         eprintln!(
             "set EARTHSCI_S3_SIGNED_TEST=s3://<bucket>/<key> (a PRIVATE object you \
@@ -139,4 +156,60 @@ fn a_named_private_bucket_reads_signed() {
         )
         .expect("revalidation must not fail");
     assert_eq!(again.bytes_written, 0, "an unchanged object was re-downloaded");
+}
+
+/// **A bucket named in `EARTHSCI_S3_BUCKET_OPTIONS` reads signed, carrying
+/// `x-amz-request-payer`.**
+///
+/// This is the shape a **requester-pays** bucket needs, and it is deliberately
+/// asserted against a bucket that is *not* requester-pays yet. That is the whole
+/// point: a requester-pays bucket refuses anonymous requests outright, so there
+/// is no way to test the path against one without first breaking every anonymous
+/// reader of it. S3 ignores the header on an ordinary bucket, so a signed read
+/// carrying it proves the plumbing — the signature, the credential chain, the
+/// header, the IAM grant — while the bucket is still public and nothing is at
+/// risk. Flip the bucket afterwards and this same code is what runs.
+///
+/// Needs the network and AWS credentials that carry `s3:GetObject` on the
+/// bucket, so it is opt-in through `EARTHSCI_S3_REQUESTER_PAYS_TEST=1`. Without
+/// the IAM grant it fails as `403 AccessDenied`, which is the correct answer to
+/// "may this identity read that bucket" and the thing worth finding out before a
+/// deployment depends on it.
+#[test]
+fn a_named_bucket_reads_signed_as_a_requester() {
+    let _lock = env_lock();
+    if std::env::var("EARTHSCI_S3_REQUESTER_PAYS_TEST").is_err() {
+        eprintln!(
+            "set EARTHSCI_S3_REQUESTER_PAYS_TEST=1 plus AWS credentials with \
+             s3:GetObject on inmap-model to run the live requester-pays read"
+        );
+        return;
+    }
+    // Named, so `signs()` says yes and the options reach `object_store`. The
+    // region is stated here too, because a per-bucket region is the other half
+    // of what one process-wide `EARTHSCI_S3_REGION` cannot express.
+    std::env::set_var(
+        earthsciio::BUCKET_OPTIONS_ENV,
+        r#"{"inmap-model":{"aws_skip_signature":"false","aws_request_payer":"true","aws_region":"us-east-2"}}"#,
+    );
+
+    let (_dir, dest) = staging();
+    let out = S3Transport::new()
+        .fetch(
+            "s3://inmap-model/isrm_v1.2.2.zarr/.zmetadata",
+            &dest,
+            &Conditional::default(),
+            None,
+        )
+        .expect(
+            "a signed requester-pays read must succeed — a 403 here is the IAM \
+             grant missing, not the transport",
+        );
+    assert!(out.bytes_written > 0, "signed requester read wrote nothing");
+    assert_eq!(
+        std::fs::metadata(&dest).expect("staged file").len(),
+        out.bytes_written
+    );
+
+    std::env::remove_var(earthsciio::BUCKET_OPTIONS_ENV);
 }

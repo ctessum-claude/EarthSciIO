@@ -118,6 +118,21 @@ pub enum Error {
         name: String,
     },
 
+    /// A configuration variable this crate reads is set to something it cannot
+    /// use.
+    ///
+    /// Deliberately an error and not a fallback to the unconfigured default: the
+    /// variables that reach here state how a store is to be *reached*, so
+    /// ignoring a malformed one produces a read that goes out with the wrong
+    /// identity and fails much later, somewhere that names neither the variable
+    /// nor the mistake.
+    BadConfig {
+        /// The environment variable at fault.
+        var: String,
+        /// Why its value could not be used.
+        detail: String,
+    },
+
     /// A format reader failed to decode a cached blob (bad magic, truncated file,
     /// an unsupported on-disk type, …). Decode parity is `spec/conformance.md` §3.
     Format {
@@ -187,6 +202,7 @@ impl std::fmt::Display for Error {
                 None => write!(f, "io error: {source}"),
             },
             Error::Manifest { detail } => write!(f, "manifest error: {detail}"),
+            Error::BadConfig { var, detail } => write!(f, "{var} is unusable: {detail}"),
             Error::UnknownFormat { name } => write!(f, "no reader registered for format '{name}'"),
             Error::Format { format, detail } => {
                 write!(f, "{format} decode error: {detail}")

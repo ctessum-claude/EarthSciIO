@@ -112,7 +112,11 @@ mod offline;
 #[cfg(not(target_arch = "wasm32"))]
 mod provider;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod s3_config;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod store;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod test_env;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
 #[cfg(not(target_arch = "wasm32"))]
@@ -152,6 +156,11 @@ pub use manifest::{Manifest, MANIFEST_SCHEMA};
 pub use offline::{is_offline, OFFLINE_ENV};
 #[cfg(not(target_arch = "wasm32"))]
 pub use provider::{DataSource, Provider, SourceTemporal, StoreAccess, Window, STORE_ACCESS_ENV};
+#[cfg(not(target_arch = "wasm32"))]
+pub use s3_config::{
+    bucket_options_from_env, options_for_bucket, options_for_url, parse_bucket_options,
+    stated_region, stated_signing, BUCKET_OPTIONS_ENV,
+};
 
 /// The 0.1.1 spelling of [`DataSource`]. From `.esm` 1.0.0 the declaration is a
 /// `data_sources` entry, not a `data_loaders` one, and its consumers spell it

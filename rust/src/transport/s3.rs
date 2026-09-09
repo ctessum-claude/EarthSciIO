@@ -103,8 +103,47 @@ fn bucket_of(s3_url: &str) -> Result<&str> {
     Ok(bucket)
 }
 
-/// Resolve the S3 region: explicit arg → `$EARTHSCI_S3_REGION` → `$AWS_REGION` →
-/// [`DEFAULT_S3_REGION`].
+/// Refuse a fetch when [`BUCKET_OPTIONS_ENV`](crate::BUCKET_OPTIONS_ENV) is set
+/// to something unparseable.
+///
+/// Checked on every fetch rather than once at construction because the variable
+/// is read on every fetch, and because a transport is built long before a
+/// deployment's environment is interesting. The cost is one small JSON parse
+/// against a variable that is usually unset.
+fn check_bucket_options() -> Result<()> {
+    crate::s3_config::bucket_options_from_env()
+        .map(|_| ())
+        .map_err(|detail| Error::BadConfig {
+            var: crate::s3_config::BUCKET_OPTIONS_ENV.to_string(),
+            detail,
+        })
+}
+
+/// Resolve the S3 region for `bucket`: explicit arg → the bucket's own
+/// `aws_region` in [`BUCKET_OPTIONS_ENV`](crate::BUCKET_OPTIONS_ENV) →
+/// `$EARTHSCI_S3_REGION` → `$AWS_REGION` → [`DEFAULT_S3_REGION`].
+///
+/// A per-bucket statement sits between the two because it is more specific than
+/// any process-wide variable and less specific than an argument a caller passed
+/// in code. This is the resolution that makes two stores in two regions
+/// readable by one process: `$EARTHSCI_S3_REGION` can only ever have one value,
+/// and getting it wrong does not fail — it reads the right bytes across a
+/// region boundary and bills for the transfer.
+pub fn resolve_region_for_bucket(bucket: &str, explicit: Option<&str>) -> String {
+    if let Some(r) = explicit {
+        return r.to_string();
+    }
+    let per_bucket = crate::s3_config::options_for_bucket(bucket);
+    if let Some(region) = crate::s3_config::stated_region(&per_bucket) {
+        return region.to_string();
+    }
+    resolve_region(None)
+}
+
+/// Resolve the S3 region without reference to a bucket: explicit arg →
+/// `$EARTHSCI_S3_REGION` → `$AWS_REGION` → [`DEFAULT_S3_REGION`].
+///
+/// Prefer [`resolve_region_for_bucket`] wherever the bucket is known.
 pub fn resolve_region(explicit: Option<&str>) -> String {
     if let Some(r) = explicit {
         return r.to_string();
@@ -143,6 +182,12 @@ pub struct S3Transport {
     http: HttpTransport,
     region: Option<String>,
     signed: BTreeSet<String>,
+    /// Whether the environment still gets a say in which buckets are signed.
+    /// Cleared by [`S3Transport::signing_buckets`], for the reason that method
+    /// replaces rather than extends: a caller stating a list gets exactly that
+    /// list, and an ambient variable adding a bucket to it would be the accident
+    /// this whole mechanism exists to avoid.
+    env_signing: bool,
 }
 
 impl S3Transport {
@@ -154,6 +199,7 @@ impl S3Transport {
             http: HttpTransport::new(),
             region: None,
             signed: signed_buckets_from_env(),
+            env_signing: true,
         }
     }
 
@@ -163,6 +209,7 @@ impl S3Transport {
             http: HttpTransport::new(),
             region: Some(region.into()),
             signed: signed_buckets_from_env(),
+            env_signing: true,
         }
     }
 
@@ -185,13 +232,36 @@ impl S3Transport {
             .map(|b| b.as_ref().trim().to_ascii_lowercase())
             .filter(|b| !b.is_empty())
             .collect();
+        self.env_signing = false;
         self
     }
 
-    /// Whether reads of `bucket` are signed.
+    /// Whether reads of `bucket` are signed: because it was **named** in
+    /// [`SIGNED_BUCKETS_ENV`] (or through [`S3Transport::signing_buckets`]), or
+    /// because [`BUCKET_OPTIONS_ENV`](crate::BUCKET_OPTIONS_ENV) states signing
+    /// for it — a credential, or `aws_skip_signature=false`.
+    ///
+    /// A bucket named in the options map only to pin its region states nothing
+    /// about signing and reads exactly as anonymously as before
+    /// ([`crate::stated_signing`]); a bucket named with
+    /// `aws_skip_signature=true` is anonymous even if the signed list names it,
+    /// because that is the more specific statement about it.
+    ///
+    /// A malformed options spec reads here as "no statement". It is not
+    /// swallowed — [`Transport::fetch`] refuses the fetch outright — but this
+    /// predicate has nowhere to put the failure and must not answer `true` on a
+    /// spec nobody could parse.
     #[must_use]
     pub fn signs(&self, bucket: &str) -> bool {
-        self.signed.contains(&bucket.to_ascii_lowercase())
+        let bucket = bucket.to_ascii_lowercase();
+        if self.env_signing {
+            if let Some(stated) =
+                crate::s3_config::stated_signing(&crate::s3_config::options_for_bucket(&bucket))
+            {
+                return stated;
+            }
+        }
+        self.signed.contains(&bucket)
     }
 
     /// The signed read, for a bucket this transport was told to sign for.
@@ -221,7 +291,7 @@ impl S3Transport {
         /// and small enough that a 2 GiB NetCDF never sits in memory.
         const CHUNK: u64 = 8 * 1024 * 1024;
 
-        let region = resolve_region(self.region.as_deref());
+        let region = resolve_region_for_bucket(bucket_of(url)?, self.region.as_deref());
         let options = crate::read_store_options(
             url,
             &[
@@ -332,10 +402,12 @@ impl Transport for S3Transport {
         conditional: &Conditional,
         auth: Option<&dyn AuthResolver>,
     ) -> Result<FetchResult> {
-        if self.signs(bucket_of(url)?) {
+        let bucket = bucket_of(url)?;
+        check_bucket_options()?;
+        if self.signs(bucket) {
             return self.fetch_signed(url, dest, conditional);
         }
-        let region = resolve_region(self.region.as_deref());
+        let region = resolve_region_for_bucket(bucket, self.region.as_deref());
         let https = s3_https_url(url, &region)?;
         self.http.fetch(&https, dest, conditional, auth)
     }
@@ -351,10 +423,12 @@ impl Transport for S3Transport {
         // staged file, which is this method's documented default. Hashing in
         // transit would be free here, but it would be a second implementation of
         // integrity to keep in step with the one the cache already runs.
-        if self.signs(bucket_of(url)?) {
+        let bucket = bucket_of(url)?;
+        check_bucket_options()?;
+        if self.signs(bucket) {
             return Ok((self.fetch_signed(url, dest, conditional)?, None));
         }
-        let region = resolve_region(self.region.as_deref());
+        let region = resolve_region_for_bucket(bucket, self.region.as_deref());
         let https = s3_https_url(url, &region)?;
         self.http.fetch_hashed(&https, dest, conditional, auth)
     }
@@ -363,6 +437,7 @@ impl Transport for S3Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvScope;
 
     #[test]
     fn scheme_is_s3() {
@@ -430,6 +505,102 @@ mod tests {
             .signing_buckets(["only-this-one"]);
         assert!(t.signs("only-this-one"));
         assert!(!t.signs("from-env-maybe"));
+    }
+
+    // --- the per-bucket statement ------------------------------------------
+
+    /// A bucket that states signing in `EARTHSCI_S3_BUCKET_OPTIONS` is signed
+    /// without having to appear in the signed list as well. One statement, not
+    /// two things to keep in step.
+    #[test]
+    fn a_named_bucket_states_its_own_signing() {
+        let _env = EnvScope::new(&[(
+            crate::BUCKET_OPTIONS_ENV,
+            r#"{"inmap-model":{"aws_skip_signature":"false"}}"#,
+        )]);
+        assert!(S3Transport::new().signs("inmap-model"));
+        assert!(!S3Transport::new().signs("some-other-bucket"));
+    }
+
+    /// The guard rail, at the transport this time: naming a bucket to pin its
+    /// region must not start signing it. A signed read of a public bucket is a
+    /// 403, and it is a 403 that only appears in the deployment.
+    #[test]
+    fn naming_a_bucket_for_its_region_does_not_start_signing_it() {
+        let _env = EnvScope::new(&[(
+            crate::BUCKET_OPTIONS_ENV,
+            r#"{"inmap-model":{"aws_region":"us-east-2"}}"#,
+        )]);
+        assert!(!S3Transport::new().signs("inmap-model"));
+    }
+
+    /// The more specific statement wins in both directions: a bucket the signed
+    /// list names can be turned back off by naming it with
+    /// `aws_skip_signature=true`.
+    #[test]
+    fn a_bucket_can_state_anonymous_against_the_signed_list() {
+        let _env = EnvScope::new(&[
+            (SIGNED_BUCKETS_ENV, "inmap-model"),
+            (
+                crate::BUCKET_OPTIONS_ENV,
+                r#"{"inmap-model":{"aws_skip_signature":"true"}}"#,
+            ),
+        ]);
+        assert!(!S3Transport::new().signs("inmap-model"));
+    }
+
+    /// `signing_buckets` replaces the environment's say entirely — including the
+    /// options map's say about signing. A caller stating its stores in code gets
+    /// exactly those, which is the whole reason that method replaces rather than
+    /// extends.
+    #[test]
+    fn an_explicit_list_also_replaces_the_options_maps_say() {
+        let _env = EnvScope::new(&[(
+            crate::BUCKET_OPTIONS_ENV,
+            r#"{"inmap-model":{"aws_skip_signature":"false"}}"#,
+        )]);
+        let t = S3Transport::new().signing_buckets(["only-this-one"]);
+        assert!(t.signs("only-this-one"));
+        assert!(!t.signs("inmap-model"));
+    }
+
+    /// A bucket's own region beats the process-wide pin. This is what makes two
+    /// stores in two regions readable by one process: `EARTHSCI_S3_REGION` has
+    /// one value, and the wrong one does not fail — it reads the right bytes
+    /// across a region boundary and bills for the transfer.
+    #[test]
+    fn a_buckets_own_region_beats_the_process_wide_pin() {
+        let _env = EnvScope::new(&[
+            ("EARTHSCI_S3_REGION", "eu-west-1"),
+            (
+                crate::BUCKET_OPTIONS_ENV,
+                r#"{"inmap-model":{"aws_region":"us-east-2"}}"#,
+            ),
+        ]);
+        assert_eq!(resolve_region_for_bucket("inmap-model", None), "us-east-2");
+        assert_eq!(resolve_region_for_bucket("other", None), "eu-west-1");
+        assert_eq!(
+            resolve_region_for_bucket("inmap-model", Some("ap-south-1")),
+            "ap-south-1",
+            "an argument passed in code is the most local statement of all"
+        );
+    }
+
+    /// A spec nobody can parse fails the fetch, rather than reading as "no
+    /// statement" and going out with the wrong identity. Checked before any
+    /// network, so this costs nothing and names the variable.
+    #[test]
+    fn a_malformed_bucket_options_spec_refuses_the_fetch() {
+        let _env = EnvScope::new(&[(crate::BUCKET_OPTIONS_ENV, "{not json")]);
+        let dest = std::env::temp_dir().join("earthsciio-bucket-options-test");
+        let err = S3Transport::new()
+            .fetch("s3://inmap-model/k", &dest, &Conditional::default(), None)
+            .unwrap_err();
+        match err {
+            Error::BadConfig { var, .. } => assert_eq!(var, crate::BUCKET_OPTIONS_ENV),
+            other => panic!("expected BadConfig, got {other}"),
+        }
+        assert!(!dest.exists(), "a refused fetch writes nothing");
     }
 
     #[test]

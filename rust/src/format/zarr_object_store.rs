@@ -101,60 +101,19 @@ use zarrs_object_store::AsyncObjectStore;
 use super::zarr_store::SanitizedV2;
 use super::{AxisSelect, NativeDataset, OutputSchema, Selection};
 use crate::error::{Error, Result};
+// The S3 option-key vocabulary these decisions are made in, and the per-bucket
+// statement that now sits between the environment and the caller. Both live in
+// `crate::s3_config` because the `s3://` transport has to reach the same
+// conclusion about the same bucket, and two copies of this vocabulary would
+// differ silently.
+use crate::s3_config::{
+    has_any, options_for_url, S3_CREDENTIAL_KEYS, S3_ENDPOINT_KEYS, S3_SIGNING_KEYS,
+    S3_STATIC_KEY_KEYS,
+};
 
 /// Environment prefixes harvested by [`store_options_from_env`], one per cloud
 /// backend, matching what each `object_store` builder's own `from_env` reads.
 const ENV_PREFIXES: [&str; 3] = ["AWS_", "GOOGLE_", "AZURE_"];
-
-/// Option keys that are a *statement about signing* rather than a credential.
-/// Honoured verbatim wherever they come from, environment included: no platform
-/// injects `AWS_SKIP_SIGNATURE`, so it can only have been written by whoever
-/// deployed this process. `=false` is how a caller asks for signed access.
-const S3_SIGNING_KEYS: [&str; 2] = ["aws_skip_signature", "skip_signature"];
-
-/// Option keys that mean "there is a way to authenticate to S3" — key material,
-/// the ambient-role pointers a container platform sets, and the assume-role
-/// inputs. Every spelling `object_store`'s own `AmazonS3ConfigKey::from_str`
-/// accepts, because it takes a prefixed *and* an unprefixed form of nearly all of
-/// them and a list naming only one of a pair is a list with a hole in it: the
-/// unnamed spelling configures a credential that this module then fails to
-/// notice, so a read the caller asked to sign goes out anonymous.
-///
-/// Presence is not by itself consent: see [`read_store_options`] for who has to
-/// have said it before signing stays on.
-const S3_CREDENTIAL_KEYS: [&str; 16] = [
-    "aws_access_key_id",
-    "access_key_id",
-    "aws_secret_access_key",
-    "secret_access_key",
-    "aws_session_token",
-    "session_token",
-    "aws_token",
-    "token",
-    "aws_container_credentials_relative_uri",
-    "container_credentials_relative_uri",
-    "aws_container_credentials_full_uri",
-    "container_credentials_full_uri",
-    "aws_web_identity_token_file",
-    "web_identity_token_file",
-    "aws_role_arn",
-    "role_arn",
-];
-
-/// Static key material, the half of [`S3_CREDENTIAL_KEYS`] an operator types
-/// out rather than a platform injecting it.
-const S3_STATIC_KEY_KEYS: [&str; 2] = ["aws_access_key_id", "access_key_id"];
-
-/// Endpoint-override keys, in every spelling `object_store` parses. An endpoint
-/// is never injected by a platform: it is always somebody pointing `s3://` at a
-/// specific S3-compatible deployment.
-const S3_ENDPOINT_KEYS: [&str; 5] = [
-    "endpoint",
-    "endpoint_url",
-    "aws_endpoint",
-    "aws_endpoint_url",
-    "aws_endpoint_url_s3",
-];
 
 fn os_err(detail: impl Into<String>) -> Error {
     Error::Format {
@@ -187,15 +146,12 @@ fn is_s3_url(url_str: &str) -> bool {
     url_str.starts_with("s3://") || url_str.starts_with("s3a://")
 }
 
-/// Does `options` carry any of `keys`?
-fn has_any(options: &[(String, String)], keys: &[&str]) -> bool {
-    options.iter().any(|(key, _)| keys.contains(&key.as_str()))
-}
-
 /// Backend options for a **read** of `url`: the process environment
-/// ([`store_options_from_env`]) with the caller's `explicit` options on top,
-/// plus the anonymous-S3 default when nothing in either has stated that this
-/// read should be signed.
+/// ([`store_options_from_env`]), then whatever
+/// [`EARTHSCI_S3_BUCKET_OPTIONS`](crate::BUCKET_OPTIONS_ENV) states about this
+/// URL's bucket, then the caller's `explicit` options on top — plus the
+/// anonymous-S3 default when nothing among the three has stated that this read
+/// should be signed.
 ///
 /// # Why the environment does not get to decide signing
 ///
@@ -212,7 +168,7 @@ fn has_any(options: &[(String, String)], keys: &[&str]) -> bool {
 /// `s3:GetObject`: **403**, in production only, because a laptop has none of
 /// those variables set.
 ///
-/// So intent has to be *stated*, and exactly three things state it:
+/// So intent has to be *stated*, and exactly four things state it:
 ///
 /// * `aws_skip_signature`, either polarity, from **any** source
 ///   ([`S3_SIGNING_KEYS`]). Nothing injects it, so `=false` is an unambiguous
@@ -220,6 +176,12 @@ fn has_any(options: &[(String, String)], keys: &[&str]) -> bool {
 /// * A credential option the **caller passed** — [`crate::DataSource::store_options`],
 ///   or the `options` argument of a `*_with_options` entry point. That is a
 ///   document or a program describing this read, not an ambient variable.
+/// * A credential **named against this bucket** in
+///   [`EARTHSCI_S3_BUCKET_OPTIONS`](crate::BUCKET_OPTIONS_ENV). A variable that
+///   names the bucket is about the bucket, which is the whole difference between
+///   it and the ambient harvest above. Naming a bucket only to pin its region
+///   states nothing and leaves a public read public — see
+///   [`crate::stated_signing`].
 /// * Static keys in the environment **next to an endpoint override**
 ///   ([`S3_ENDPOINT_KEYS`]): the R2 / MinIO / Backblaze B2 / Ceph deployment.
 ///   An endpoint is never injected either, so credentials beside one belong to
@@ -266,18 +228,22 @@ fn has_any(options: &[(String, String)], keys: &[&str]) -> bool {
 /// for a store that should read anonymously.
 #[must_use]
 pub fn read_store_options(url: &str, explicit: &[(String, String)]) -> Vec<(String, String)> {
+    // Ambient first, then the bucket somebody named, then this caller: each
+    // layer is more deliberate and more specific than the one under it.
+    let per_bucket = options_for_url(url);
     let mut merged = store_options_from_env();
-    for (k, v) in explicit {
+    for (k, v) in per_bucket.iter().chain(explicit.iter()) {
         merged.retain(|(mk, _)| mk != k);
         merged.push((k.clone(), v.clone()));
     }
     if !is_s3_url(url) || has_any(&merged, &S3_SIGNING_KEYS) {
         return merged;
     }
-    let stated_by_the_caller = has_any(explicit, &S3_CREDENTIAL_KEYS);
+    let stated_for_this_read =
+        has_any(explicit, &S3_CREDENTIAL_KEYS) || has_any(&per_bucket, &S3_CREDENTIAL_KEYS);
     let configured_s3_compatible_endpoint =
         has_any(&merged, &S3_ENDPOINT_KEYS) && has_any(&merged, &S3_STATIC_KEY_KEYS);
-    if !stated_by_the_caller && !configured_s3_compatible_endpoint {
+    if !stated_for_this_read && !configured_s3_compatible_endpoint {
         merged.push(("aws_skip_signature".to_string(), "true".to_string()));
     }
     merged
@@ -733,53 +699,7 @@ mod tests {
     // not exist. These pin which of the two it is.
     // -----------------------------------------------------------------------
 
-    /// Serializes the tests that mutate the process environment, so one test's
-    /// `AWS_*` variable cannot appear in another test's harvest.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A known environment for the duration of a scope, restored on the way out
-    /// whether the test passes or panics. Holds [`ENV_LOCK`] while it lives.
-    ///
-    /// It **removes every harvested variable first**, because these tests are
-    /// about what the ambient environment does to a read: one left over from the
-    /// developer's shell (`AWS_PROFILE`, a real `AWS_ACCESS_KEY_ID`) would
-    /// otherwise decide the outcome, which is the very failure mode under test.
-    struct EnvScope {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        restore: Vec<(String, String)>,
-        clear: Vec<String>,
-    }
-
-    impl EnvScope {
-        fn new(vars: &[(&str, &str)]) -> Self {
-            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let restore: Vec<(String, String)> = std::env::vars()
-                .filter(|(k, _)| ENV_PREFIXES.iter().any(|p| k.starts_with(p)))
-                .collect();
-            for (k, _) in &restore {
-                std::env::remove_var(k);
-            }
-            for (k, v) in vars {
-                std::env::set_var(k, v);
-            }
-            Self {
-                _guard: guard,
-                restore,
-                clear: vars.iter().map(|(k, _)| (*k).to_string()).collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvScope {
-        fn drop(&mut self) {
-            for k in &self.clear {
-                std::env::remove_var(k);
-            }
-            for (k, v) in &self.restore {
-                std::env::set_var(k, v);
-            }
-        }
-    }
+    use crate::test_env::EnvScope;
 
     fn value<'a>(options: &'a [(String, String)], key: &str) -> Option<&'a str> {
         options
@@ -982,6 +902,136 @@ mod tests {
             Some("true"),
             "an endpoint alone is still an anonymous read"
         );
+    }
+
+    // --- the per-bucket statement ------------------------------------------
+    //
+    // `EARTHSCI_S3_BUCKET_OPTIONS` exists because a process can need two
+    // different answers about two different buckets at once: our own private
+    // store beside somebody else's requester-pays one. These pin the precedence
+    // it sits at, and — the property that matters most — that naming a bucket
+    // for one reason does not quietly change the answer to the other question.
+    // -----------------------------------------------------------------------
+
+    /// The spec for the case it was written for.
+    const REQUESTER_PAYS: &str = r#"{"inmap-model":{"aws_skip_signature":"false","aws_request_payer":"true","aws_region":"us-east-2"}}"#;
+
+    /// A bucket's own statement outranks an ambient variable, because the
+    /// ambient one describes a process and this one describes a bucket.
+    #[test]
+    fn a_named_bucket_outranks_the_environment() {
+        let _env = EnvScope::new(&[
+            ("AWS_REGION", "eu-west-1"),
+            (crate::BUCKET_OPTIONS_ENV, REQUESTER_PAYS),
+        ]);
+        let opts = resolved_read_options(PUBLIC_STORE, &[]);
+        assert_eq!(value(&opts, "aws_region"), Some("us-east-2"));
+        assert_eq!(value(&opts, "aws_request_payer"), Some("true"));
+        assert_eq!(
+            value(&opts, "aws_skip_signature"),
+            Some("false"),
+            "naming the bucket with a signing statement is stating intent"
+        );
+    }
+
+    /// …and loses to the caller, who is describing one loader rather than one
+    /// deployment.
+    #[test]
+    fn a_caller_still_outranks_a_named_bucket() {
+        let _env = EnvScope::new(&[(crate::BUCKET_OPTIONS_ENV, REQUESTER_PAYS)]);
+        let stated = [("aws_region".to_string(), "us-west-2".to_string())];
+        let opts = resolved_read_options(PUBLIC_STORE, &stated);
+        assert_eq!(value(&opts, "aws_region"), Some("us-west-2"));
+        assert_eq!(
+            value(&opts, "aws_request_payer"),
+            Some("true"),
+            "overriding one key must not discard the rest of the bucket's options"
+        );
+    }
+
+    /// The guard rail. A bucket named only to pin its region says NOTHING about
+    /// signing, so the anonymous default still applies — otherwise the mechanism
+    /// would have reintroduced, through its own front door, the exact failure it
+    /// was built beside: a public read signed with a role that cannot read it.
+    #[test]
+    fn naming_a_bucket_to_pin_its_region_leaves_the_read_anonymous() {
+        let _env = EnvScope::new(&[
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", ECS_ROLE_URI),
+            (
+                crate::BUCKET_OPTIONS_ENV,
+                r#"{"inmap-model":{"aws_region":"us-east-2"}}"#,
+            ),
+        ]);
+        let opts = resolved_read_options(PUBLIC_STORE, &[]);
+        assert_eq!(value(&opts, "aws_region"), Some("us-east-2"));
+        assert_eq!(
+            value(&opts, "aws_skip_signature"),
+            Some("true"),
+            "a region is not a statement about signing"
+        );
+    }
+
+    /// A credential named against a bucket IS a statement, unlike the same
+    /// credential harvested from the environment. The difference is that this
+    /// one names the bucket it is for.
+    #[test]
+    fn a_credential_named_against_a_bucket_signs_that_bucket() {
+        let _env = EnvScope::new(&[(
+            crate::BUCKET_OPTIONS_ENV,
+            r#"{"private-bucket":{"aws_access_key_id":"AKIAEXAMPLENOTREAL","aws_secret_access_key":"not-a-real-secret-for-tests"}}"#,
+        )]);
+        let opts = resolved_read_options("s3://private-bucket/store.zarr", &[]);
+        assert_eq!(value(&opts, "aws_skip_signature"), None);
+        assert_eq!(value(&opts, "aws_access_key_id"), Some("AKIAEXAMPLENOTREAL"));
+
+        // …and only that bucket. The point of the whole exercise.
+        let opts = resolved_read_options(PUBLIC_STORE, &[]);
+        assert_eq!(value(&opts, "aws_skip_signature"), Some("true"));
+        assert_eq!(value(&opts, "aws_access_key_id"), None);
+    }
+
+    /// A bucket nobody named reads exactly as it did before.
+    #[test]
+    fn an_unnamed_bucket_is_untouched() {
+        let _env = EnvScope::new(&[(crate::BUCKET_OPTIONS_ENV, REQUESTER_PAYS)]);
+        let opts = resolved_read_options("s3://some-other-bucket/store.zarr", &[]);
+        assert_eq!(value(&opts, "aws_request_payer"), None);
+        assert_eq!(value(&opts, "aws_skip_signature"), Some("true"));
+    }
+
+    /// `aws_request_payer` has to be a key `object_store` actually parses, or
+    /// the whole mechanism is an option nobody reads and a 403 nobody predicted.
+    /// Asserted the way
+    /// `every_credential_and_endpoint_spelling_is_one_object_store_parses`
+    /// asserts the rest of the vocabulary: by building the backend.
+    #[test]
+    fn request_payer_is_a_key_object_store_parses() {
+        let opts: Vec<(String, String)> = [
+            ("aws_request_payer", "true"),
+            ("aws_region", "us-east-2"),
+            ("aws_skip_signature", "false"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        assert!(
+            resolve_backend("s3://inmap-model/k", &opts).is_ok(),
+            "object_store must recognise aws_request_payer"
+        );
+    }
+
+    /// A spec nobody can parse must not read as "no options for this bucket" —
+    /// that is a read that goes out anonymous and fails much later, against
+    /// whichever bucket needed the statement. The option path has nowhere to put
+    /// the failure, so it yields nothing here and the TRANSPORT refuses the
+    /// fetch (see `transport::s3`'s
+    /// `a_malformed_bucket_options_spec_refuses_the_fetch`).
+    #[test]
+    fn a_malformed_spec_yields_no_options_here_and_is_refused_at_the_transport() {
+        let _env = EnvScope::new(&[(crate::BUCKET_OPTIONS_ENV, "{not json")]);
+        let opts = resolved_read_options(PUBLIC_STORE, &[]);
+        assert_eq!(value(&opts, "aws_request_payer"), None);
+        assert!(crate::bucket_options_from_env().is_err());
     }
 
     /// The read default is a READ default. A runner reads a public store and
