@@ -239,7 +239,8 @@ struct CdsTransport <: Transport end
 schemes(::CdsTransport) = ["cds"]
 
 function fetch!(::CdsTransport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)   # CDS serves whole blobs, never a store
     dataset, request = parse_cds_url(url)
     api_key = cds_token(auth)
     endpoint = cds_api_endpoint()

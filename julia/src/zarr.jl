@@ -286,8 +286,14 @@ end
 
 # --- object fetch helpers ---------------------------------------------------
 
+# Every object of the store is fetched through here -- `.zarray`/`.zattrs`/
+# `zarr.json` metadata and each intersecting chunk alike -- so this is the one
+# place that tells the transport it is fetching a per-object store read, not a
+# whole blob. It buys a SHORTER whole-call timeout budget: a scan issues hundreds
+# of these, and a pathological source must not be able to sit on one small chunk
+# for the whole-blob budget (2 h) before erroring (transport.jl).
 function _fetch_bytes(cache::Cache, url::AbstractString)
-    entry = fetch_blob(cache, url)
+    entry = fetch_blob(cache, url; store_read = true)
     return read(entry.path)
 end
 

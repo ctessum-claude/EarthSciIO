@@ -312,3 +312,87 @@ end
         EarthSciIO._reset_http_downloader!()
     end
 end
+
+# --- a store-backed (per-object) read gets its own, shorter budget -----------
+# `fetch!` runs once per zarr chunk object, so the whole-blob budget (2 h, right
+# for a single multi-GB file) is the wrong bound for one small chunk: a source
+# that trickles above the bytes/s floor could sit on ONE chunk for two hours,
+# times the object count of a scan. The store path therefore passes
+# `store_read=true`, which selects `EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE`.
+function _start_trickle_server(; chunk::Int = 512, pause::Float64 = 0.25,
+                               claimed::Int = 1048576, pieces::Int = 400)
+    server = listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    @async try
+        while true
+            conn = accept(server)
+            @async try
+                _read_http_request(conn)
+                write(conn, "HTTP/1.1 200 OK\r\nContent-Length: $claimed\r\n",
+                      "Connection: close\r\n\r\n")
+                for _ in 1:pieces
+                    write(conn, zeros(UInt8, chunk)); flush(conn); sleep(pause)
+                end
+            catch
+            finally
+                close(conn)
+            end
+        end
+    catch
+    end
+    return server, port
+end
+
+@testset "http transport — a store-backed read is bounded by TIMEOUT_MAX_STORE" begin
+    # Driven through the zarr object-fetch helper (the real seam), not through
+    # `fetch!` directly, so the test measures BEHAVIOUR and cannot be satisfied
+    # by a signature alone. The whole-blob ceiling here is 25 s and the store one
+    # 2 s; a per-object read must honour the latter.
+    server, port = _start_trickle_server()
+    root = mktempdir()
+    try
+        c = Cache(LocalStore(root); offline = false)
+        t0 = time()
+        withenv("EARTHSCIIO_HTTP_TIMEOUT" => "1",
+                "EARTHSCIIO_HTTP_RETRIES" => "2",
+                "EARTHSCIIO_HTTP_TIMEOUT_MAX" => "25",
+                "EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE" => "2",
+                "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
+            EarthSciIO._reset_http_downloader!()
+            @test_throws Exception EarthSciIO._fetch_bytes(c, "http://127.0.0.1:$port/c/0.0.0")
+        end
+        # 2 s budget (its own floor is RETRIES x TIMEOUT = 2 s). On the whole-blob
+        # ceiling this same fetch walks the extension ladder for its full 25 s.
+        @test time() - t0 < 15
+    finally
+        close(server)
+        EarthSciIO._reset_http_downloader!()
+        rm(root; recursive = true, force = true)
+    end
+end
+
+@testset "http transport — the store budget never shortens a whole-blob fetch" begin
+    # The mirror of the test above: with a 1 s store ceiling and a 6 s whole-blob
+    # ceiling, a default (`store_read=false`) fetch must spend the SIX -- the
+    # shorter per-object bound must not leak into a multi-GB single-file download.
+    server, port = _start_trickle_server()
+    dest = tempname()
+    try
+        t0 = time()
+        withenv("EARTHSCIIO_HTTP_TIMEOUT" => "1",
+                "EARTHSCIIO_HTTP_RETRIES" => "2",
+                "EARTHSCIIO_HTTP_TIMEOUT_MAX" => "6",
+                "EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE" => "1",
+                "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
+            EarthSciIO._reset_http_downloader!()
+            @test_throws Exception EarthSciIO.fetch!(
+                EarthSciIO.HttpTransport(), "http://127.0.0.1:$port/blob.bin", dest)
+        end
+        el = time() - t0
+        @test el >= 4     # spent its own 6 s budget (a lower bound: load only lengthens it)
+        @test el < 30
+    finally
+        close(server); rm(dest; force = true)
+        EarthSciIO._reset_http_downloader!()
+    end
+end

@@ -98,7 +98,11 @@ make_store(name::AbstractString; kwargs...) = STORE_REGISTRY[name](; kwargs...)
 
 # --- interface generic functions (concrete backends add methods) ------------
 
-# Transport: schemes() + fetch!(transport, url, dest; conditional, auth)
+# Transport: schemes() + fetch!(transport, url, dest; conditional, auth, store_read)
+# `store_read=true` marks a fetch of ONE OBJECT of a store-backed read (a Zarr
+# chunk), which is small and issued hundreds of times per scan, so a transport
+# may bound it more tightly than a whole-blob fetch. A transport with no such
+# bound accepts and ignores it.
 function schemes end
 function fetch! end
 

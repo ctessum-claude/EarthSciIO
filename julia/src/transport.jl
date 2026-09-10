@@ -72,13 +72,40 @@ end
 # after a failed/aborted transfer, whose handle may be wedged).
 _reset_http_downloader!() = (_HTTP_DOWNLOADER[] = nothing)
 
+# The ceiling on one fetch (both on any single extended attempt and, with the
+# retry floor below, on the whole call). It depends on WHAT is being fetched, and
+# only the CALLER knows that -- the transport must never infer it from the URL or
+# from a size it has not fetched yet:
+#
+#   * a WHOLE BLOB (`store_read=false`, the default) is one self-contained file
+#     and can legitimately be multi-GB -- a 0.25 deg GEOS-FP A3dyn day is 3.80 GB
+#     -- so it keeps the long 7200 s ceiling: better a slow success than a failure
+#     that forces the whole file to be downloaded again from byte zero.
+#   * a STORE-BACKED READ (`store_read=true`) is ONE OBJECT of a directory-like
+#     store -- a Zarr chunk, `.zarray`, `.zattrs` -- and `fetch!` is called once
+#     PER OBJECT (zarr.jl), hundreds of times in one scan. A chunk is small by
+#     construction (the pinned ISRM store's are ~21 MB decompressed; a chunk that
+#     needed hours would defeat the point of chunking), so 2 h per object is the
+#     wrong shape of bound: a pathological source would block on ONE chunk for
+#     two hours and the scan would take that times its object count. Minutes, not
+#     hours: 600 s still covers a 100 MB chunk at a very poor 200 KB/s, and still
+#     leaves room for one full 90 -> 360 s extension step plus a retry after it.
+#
+# Both go through the same `max(ceiling, tries * timeout)` floor at the call site,
+# so NEITHER ceiling can take away retries the un-extended schedule would have had
+# -- lowering it only shortens the extension ladder.
+_http_store_read_ceiling(store_read::Bool) =
+    store_read ? _http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE", 600) :
+                 _http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX", 7200)
+
 """HTTP/HTTPS transport: GET with conditional-GET revalidation. Mirror failover
 is handled at the call site (the cache tries mirror URLs in order)."""
 struct HttpTransport <: Transport end
 schemes(::HttpTransport) = ["http", "https"]
 
 function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)
     headers = Pair{String,String}[]
     append!(headers, auth_headers(auth, url))
     et = get(conditional, :etag, nothing)
@@ -88,7 +115,7 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
 
     tries   = max(1, _http_env_int("EARTHSCIIO_HTTP_RETRIES", 5))
     timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-ATTEMPT cap (s)
-    tmax    = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX", 7200))
+    tmax    = Float64(_http_store_read_ceiling(store_read))
     base_timeout = timeout
     # `timeout` is a TOTAL per-request cap, so on its own it also caps the SIZE
     # of a blob this transport can fetch: at a realistic 40 MB/s the 90 s default
@@ -111,8 +138,10 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
     # budget is the very hang this cap exists to prevent -- a source trickling
     # just above the bytes/s floor is never aborted by libcurl and would walk the
     # whole ladder (90+360+1440+5760+7200 s) and then still be charged its
-    # retries. One deadline for the whole call bounds that: `TIMEOUT_MAX` is the
-    # ceiling on the ENTIRE fetch, and each attempt is clamped to what is left.
+    # retries. One deadline for the whole call bounds that: `tmax` (see
+    # `_http_store_read_ceiling` -- shorter for a per-object store read than for a
+    # whole blob) is the ceiling on the ENTIRE fetch, and each attempt is clamped
+    # to what is left.
     # The floor of `tries * timeout` keeps the deadline from ever taking away
     # retries the un-extended schedule would have had, so lowering `TIMEOUT_MAX`
     # only shortens the extension ladder -- it never makes plain retries worse.
@@ -200,7 +229,8 @@ struct FileTransport <: Transport end
 schemes(::FileTransport) = ["file"]
 
 function fetch!(::FileTransport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)   # a local copy has no timeout to bound
     src = file_url_to_path(url)
     isfile(src) || error("file transport: source not found: $src (from $url)")
     cp(src, dest; force = true)
@@ -265,7 +295,9 @@ S3Transport(; region = nothing) = S3Transport(region === nothing ? nothing : Str
 schemes(::S3Transport) = ["s3"]
 
 function fetch!(t::S3Transport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)
     https_url = s3_https_url(url, t.region)
-    return fetch!(t.http, https_url, dest; conditional = conditional, auth = auth)
+    return fetch!(t.http, https_url, dest; conditional = conditional, auth = auth,
+                  store_read = store_read)
 end

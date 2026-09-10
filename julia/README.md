@@ -71,10 +71,18 @@ attempt that timed out **having written bytes** buys a 4× bigger cap and is not
 charged a retry — up to `EARTHSCIIO_HTTP_TIMEOUT_MAX`, which bounds the entire
 `fetch!` call, retries and backoff included.
 
+That ceiling is per *kind of fetch*, chosen by the caller (never inferred from
+the URL): a **whole blob** is one self-contained file and may legitimately be
+multi-GB, but a **store-backed read** (the zarr reader) fetches one *object* per
+`fetch!` call — a chunk, hundreds per scan — so it uses the lower
+`EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE` and a pathological source cannot block one
+small chunk for hours.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `EARTHSCIIO_HTTP_TIMEOUT` | `90` | per-attempt wall-clock cap (s) |
 | `EARTHSCIIO_HTTP_TIMEOUT_MAX` | `7200` | cap on any one extended attempt, and — together with a `RETRIES × TIMEOUT` floor — on the **whole** fetch of one URL (s) |
+| `EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE` | `600` | the same ceiling for a store-backed (one object per call) read, e.g. a zarr chunk (s) |
 | `EARTHSCIIO_HTTP_RETRIES` | `5` | attempts charged (a progress-earning attempt is refunded) |
 | `EARTHSCIIO_HTTP_LOW_SPEED_LIMIT` | `1024` | bytes/s floor |
 | `EARTHSCIIO_HTTP_LOW_SPEED_TIME` | `30` | abort after this long below the floor (s) |
