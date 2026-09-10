@@ -153,7 +153,7 @@ write(
 # Parquet2.jl folds those bytes into an Int64 with no sign extension, so every
 # negative in a column narrower than 8 bytes came back as its huge unsigned
 # reinterpretation until `EarthSciIOParquet2Ext` repaired it. The precisions
-# below are one per width: 2 -> 2 bytes, 4 -> 2, 9 -> 4, 12 -> 6, 18 -> 8 (the
+# below are one per width: 2 -> 1 byte, 4 -> 2, 9 -> 4, 12 -> 6, 18 -> 8 (the
 # width that never needed repairing). Each column carries its extreme negative,
 # its extreme positive, and the cells either side of zero.
 write(

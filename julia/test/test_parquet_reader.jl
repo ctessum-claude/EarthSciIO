@@ -317,6 +317,73 @@ end
         end
     end
 
+    # The fixture above reaches the widths pyarrow picks for those precisions —
+    # 1, 2, 4, 6 and 8 bytes — which leaves widths 3 and 5 (and every scale but
+    # the two it uses) untested, on a repair that had NO passing coverage at all
+    # until the `round(Float64, ...)` MethodError above it was fixed. So drive
+    # `_decimal_sign_fix`'s closure DIRECTLY over every width the guard admits,
+    # at every scale Parquet permits for it, against the extremes where a sign
+    # repair can go wrong.
+    #
+    # The oracle is the OTHER TWO TRACKS' arithmetic, spelled out: Rust and
+    # Python both compute `f64(unscaled) / 10.0^scale`, so that expression is
+    # what the closure has to reproduce BIT-FOR-BIT (spec/conformance.md §3 —
+    # a wrong number is never a permitted divergence). The input is what
+    # Parquet2 actually hands over: the `w` bytes folded UNSIGNED into a
+    # `Dec64`, i.e. `unscaled + 2^(8w)` for a negative, scaled by `10^-scale`.
+    @testset "the FLBA sign repair is exact at every width and scale" begin
+        ext = Base.get_extension(EarthSciIO, :EarthSciIOParquet2Ext)
+        @test ext !== nothing
+        sign_fix = ext._decimal_sign_fix
+        # Parquet2's `ParqDecimal` carries the scale as a NEGATIVE exponent, and
+        # `_decimal_sign_fix` reads nothing else off it.
+        pt(scale) = (scale = -scale,)
+
+        # The largest number of decimal digits a `w`-byte two's-complement FLBA
+        # can hold: floor(log10(2^(8w-1) - 1)). Parquet caps a column's
+        # precision at this, so it also caps the scale.
+        maxprec = [2, 4, 6, 9, 11, 14]
+
+        # `unscaled`/`scale` as an exact `Dec64`, built from the decimal string
+        # so no binary arithmetic sits between the integer and the value.
+        function dec(unscaled::Integer, scale::Integer)
+            digits = string(abs(unscaled))
+            if scale > 0
+                digits = lpad(digits, scale + 1, '0')
+                digits = digits[1:(end - scale)] * "." * digits[(end - scale + 1):end]
+            end
+            return Parquet2.Dec64((unscaled < 0 ? "-" : "") * digits)
+        end
+
+        for width in 1:6
+            prec = maxprec[width]
+            top = 10^prec - 1              # the extreme |unscaled| at this width
+            wrap = Int64(1) << (8 * width) # the unsigned fold's offset
+            for scale in 0:prec
+                fix = sign_fix(pt(scale), width)
+                @test fix !== nothing
+                for unscaled in unique(Int64[0, 1, -1, top, -top, top - 1,
+                                             -(top - 1), 10^scale, -(10^scale),
+                                             div(top, 3), -div(top, 3)])
+                    abs(unscaled) > top && continue   # not a legal cell here
+                    stored = unscaled < 0 ? unscaled + wrap : unscaled
+                    # A negative's unsigned fold must still fit `Dec64`'s 16
+                    # digits — the whole reason the guard stops at 7 bytes.
+                    @test ndigits(stored) <= 16
+                    @test fix(dec(stored, scale)) === Float64(unscaled) / 10.0^scale
+                end
+            end
+        end
+
+        # The guard's other side. 7 bytes is beyond reach (2^56 overflows a
+        # `Dec64`, so Parquet2 throws first — the testset below pins the message);
+        # 8 bytes and wider never needed a repair, and applying one there would
+        # CREATE the wrongness it exists to remove. All of them must decline.
+        for width in (nothing, 7, 8, 9, 16)
+            @test sign_fix(pt(2), width) === nothing
+        end
+    end
+
     # The ONE width the repair cannot reach: a 7-byte FLBA (pyarrow precision
     # 15-16). The unsigned fold of a negative is 2^56 — 17 decimal digits, which
     # overflows a `Dec64`'s 16 — so Parquet2 throws during page decode, before

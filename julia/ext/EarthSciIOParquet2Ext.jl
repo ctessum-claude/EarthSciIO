@@ -127,7 +127,7 @@ function _decimal_sign_fix(pt, width)
         # The unscaled integer, recovered exactly: |unscaled| < 2^48 here, well
         # inside binary64's exact range, so the round-trip through Float64 and
         # back is lossless.
-        u = round(Float64, Float64(x) * den)
+        u = round(Float64(x) * den)
         u < limit && return Float64(x)
         return (u - wrap) / den
     end
