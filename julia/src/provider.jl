@@ -107,6 +107,27 @@ function Provider(cache::Cache, url; format::AbstractString,
             "records_per_sample=2 needs a time_dim to bracket along"))
     kw = Dict{Symbol,Any}(pairs(reader_kwargs))
     _check_reader_kwargs(FORMAT_REGISTRY[format], String(format), kw)
+    # A `time_dim` makes the RECORD AXIS the Provider's: it resolves a cadence
+    # tick to that file's own record (`_file_record`) and slices — or brackets —
+    # there. A `records` baked into `reader_kwargs` narrows the very same axis
+    # BEHIND that resolution, so the tick is then located inside an
+    # already-narrowed axis: with a one-record `records` every tick becomes
+    # `mod1(tick, 1) == 1` and `refresh` hands back the SAME record at every
+    # tick, and `records_per_sample=2` degenerates to `[r, r]` so a downstream
+    # interpolation runs on a constant field. That is a silently wrong number, so
+    # it is refused here rather than decoded (spec/registries.md §2.1, the same
+    # rule that makes an unrecognised option an error rather than an ignored key).
+    # `records = nothing` stays legal: it asks only to skip the pushdown and read
+    # the record axis whole, which is what `_records_pushdown` then does.
+    if time_dim !== nothing && get(kw, :records, nothing) !== nothing
+        throw(ArgumentError(
+            "reader option `records` may not be baked into a provider that owns a " *
+            "record axis (time_dim=$(repr(String(time_dim)))): the Provider resolves " *
+            "each cadence tick to a file-local record and pushes THAT down, so a " *
+            "caller-supplied `records` would narrow the axis the tick is located " *
+            "inside and every tick would read the same record. Drop it — or pass " *
+            "`records = nothing` to opt out of the pushdown and read the axis whole"))
+    end
     url_for = url isa AbstractString ? (let u = String(url); _ -> u; end) : url
     return Provider(cache, String(format), cadence, tvec, url_for,
                     time_dim === nothing ? nothing : String(time_dim),
@@ -306,7 +327,10 @@ _file_record(tick::Integer, len::Integer) = len <= 0 ? Int(tick) : mod1(Int(tick
 # whole cadence axis and slicing afterwards? Three things must hold: the reader
 # declares a `records` decode option (the same `reader_option_keys` rule the
 # `variables` projection uses), the caller has not baked a `records` of its own
-# into `reader_kwargs`, and the source is a whole-file blob — a store-backed
+# into `reader_kwargs` (only `nothing` can be baked beside a `time_dim` — the
+# constructor refuses any other value, because narrowing the record axis behind
+# the Provider's own tick→record resolution reads the wrong record), and the
+# source is a whole-file blob — a store-backed
 # reader narrows records through `select`, whose chunk arithmetic already shrinks
 # the FETCH, and must not be handed a second, conflicting mechanism.
 function _records_pushdown(p::Provider)

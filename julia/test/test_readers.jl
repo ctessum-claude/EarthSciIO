@@ -577,6 +577,12 @@ end
     end
 end
 
+# A callable STRUCT in the `records["indices"]` position — the resolver form spelled
+# without a closure. Top level, because a struct cannot be defined inside a
+# `@testset begin` block.
+struct LastRecord end
+(::LastRecord)(len::Integer) = [len - 1]
+
 @testset "netcdf reader — `records` pushdown (the cadence owner's record axis)" begin
     era5_case = JSON.parsefile(joinpath(CORPUS, "cases", "era5-grid-sub-tile.json"))
     blob = joinpath(CORPUS, era5_case["blob_path"])
@@ -672,6 +678,15 @@ end
         "indices" => len -> (called[] = true; Int[])))
     @test !called[]
     @test isequal(absent["t2m"].data, full["t2m"].data)
+    # "Callable" means callable, not `isa Function`: a callable STRUCT is the
+    # spelling a caller with per-file state reaches for, and it must resolve
+    # rather than fall through to the list branch and die in `iterate`.
+    fn = read_native(reader, blob;
+                     records = Dict("dim" => "time", "indices" => LastRecord()))
+    @test isequal(fn["t2m"].data, full["t2m"].data[2:2, :, :])
+    @test isequal(read_native(reader, blob;
+        records = Dict("dim" => "no-such-dim", "indices" => LastRecord()))["t2m"].data,
+        full["t2m"].data)
 end
 
 @testset "reader edge cases" begin

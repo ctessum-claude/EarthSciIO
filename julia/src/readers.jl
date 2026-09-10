@@ -431,6 +431,13 @@ function _netcdf_dim_selection(ds, select)
     return isempty(out) ? nothing : out
 end
 
+# Is a `records["indices"]` the CALLABLE form (`len -> indices`) rather than a
+# literal index list? Asked with `applicable` rather than `isa Function`, because
+# `Union{Function,Type}` misses a callable STRUCT — which would then fall through
+# to the list branch and die inside `iterate` with a bare `MethodError` instead of
+# being resolved as the documented callable.
+_records_resolver(x) = applicable(x, 1)
+
 # Fold a `records` pushdown into the dimension→indices map `sel` built from
 # `select`. The two vocabularies meet here on purpose: a record selection IS a
 # one-axis index list, so it rides the same hyperslab/gather machinery below and
@@ -449,13 +456,13 @@ function _netcdf_merge_records(ds, sel, records)
         # called and no selection is made, which is exactly what the caller would
         # have done had it probed and found nothing. A LITERAL list was written
         # against an axis the blob does not have, and that is a mistake.
-        want isa Union{Function,Base.Callable} && return sel
+        _records_resolver(want) && return sel
         throw(ArgumentError(
             "records names dimension '$d', which the blob does not have; present: " *
             "$(sort!(String[String(k) for k in keys(ds.dim)]))"))
     end
     len = Int(ds.dim[d])
-    idxs = Int[Int(i) for i in (want isa Union{Function,Base.Callable} ? want(len) : want)]
+    idxs = Int[Int(i) for i in (_records_resolver(want) ? want(len) : want)]
     isempty(idxs) && throw(ArgumentError(
         "records asks for no records of '$d'; an empty selection is an error, " *
         "not a whole-axis read"))

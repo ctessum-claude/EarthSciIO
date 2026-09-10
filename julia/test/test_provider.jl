@@ -278,6 +278,185 @@ end
             @test !EarthSciIO._records_pushdown(discrete_provider(two, urls, times;
                 format = "netcdf", records_per_sample = nothing))  # no time_dim
         end
+
+        @testset "a baked `records` beside a time_dim is refused, not honoured" begin
+            # `records = nothing` opts out of the pushdown, and that is the only
+            # value a provider that OWNS a record axis may carry. Any other value
+            # narrows the axis BEHIND the Provider's tick->record resolution, so
+            # the tick is located inside the already-narrowed axis: a one-record
+            # `records` makes every tick `mod1(tick, 1) == 1`, so `refresh` hands
+            # back the same record at every tick and a `records_per_sample=2`
+            # bracket degenerates to [r, r] — a constant field where the model
+            # expected to interpolate. Silently wrong numbers, refused at
+            # construction (spec/registries.md §2.1).
+            e = try
+                discrete_provider(two, urls, times; format = "netcdf",
+                                  time_dim = "time", records_per_sample = 2,
+                                  reader_kwargs = (records = Dict("dim" => "time",
+                                                                  "indices" => [0]),))
+                nothing
+            catch err
+                err
+            end
+            @test e isa ArgumentError
+            @test occursin("`records` may not be baked", sprint(showerror, e))
+            @test occursin("time_dim", sprint(showerror, e))
+            # ...while `nothing` (the opt-out) and a provider with no record axis
+            # of its own are both fine.
+            @test mkref(2) isa Provider
+            @test discrete_provider(two, urls, times; format = "netcdf",
+                reader_kwargs = (records = Dict("dim" => "time",
+                                               "indices" => [0]),)) isa Provider
+        end
+    end
+
+    @testset "record pushdown == whole-file read, over a real multi-record cadence" begin
+        # THE equivalence gate for the pushdown. The fixture above holds only TWO
+        # records, where the interior bracket `[0, 1]` is the whole axis and a
+        # narrowed decode cannot be told from a full one. These files hold three
+        # and four, so every bracket below is a genuine subset — and every sample
+        # the pushdown produces is compared, field for field and byte for byte,
+        # against the SAME provider forced onto the historical whole-file path.
+        #
+        # Written here rather than taken from the corpus because the corpus is the
+        # cross-language gate and this is a Julia-track decode optimisation; the
+        # numbers it must not change are the ones the reference path produces.
+        NC = EarthSciIO.NCDatasets
+        function write_cadence_nc(path; nrec::Int, base::Float64, t0::Float64)
+            NC.NCDataset(path, "c") do ds
+                NC.defDim(ds, "time", nrec)
+                NC.defDim(ds, "latitude", 2)
+                NC.defDim(ds, "longitude", 3)
+                tv = NC.defVar(ds, "time", Float64, ("time",))
+                tv.attrib["units"] = "hours since 2018-11-09 00:00:00"
+                tv.attrib["calendar"] = "standard"
+                tv[:] = collect(t0:(t0 + nrec - 1))
+                lat = NC.defVar(ds, "latitude", Float64, ("latitude",))
+                lat[:] = [40.0, 41.0]
+                lon = NC.defVar(ds, "longitude", Float64, ("longitude",))
+                lon[:] = [-90.0, -89.0, -88.0]
+                # `t2m` carries the record axis: record r is the constant base+r,
+                # so a mis-bracketed record shows up as a wrong NUMBER, not a
+                # wrong shape. `orog` carries no record axis and must pass through
+                # both paths untouched.
+                v = NC.defVar(ds, "t2m", Float64, ("longitude", "latitude", "time"))
+                for r in 1:nrec
+                    v[:, :, r] .= base + r
+                end
+                o = NC.defVar(ds, "orog", Float64, ("longitude", "latitude"))
+                o[:, :] .= 7.0
+            end
+            return path
+        end
+        function stage(specs)                     # url => (nrec, base, t0)
+            root = mktempdir()
+            for (u, (nrec, base, t0)) in specs
+                k = cache_key(u)
+                d = joinpath(root, "v1", "blobs", k[1:2]); mkpath(d)
+                write_cadence_nc(joinpath(d, k * ".nc"); nrec = nrec, base = base, t0 = t0)
+            end
+            return Cache(LocalStore(root); offline = true, verify = false)
+        end
+        push_ref(c, urls, ts; kw...) = (
+            discrete_provider(c, urls, ts; format = "netcdf", kw...),
+            discrete_provider(c, urls, ts; format = "netcdf",
+                              reader_kwargs = (records = nothing,), kw...))
+        # Every sample of every cadence, at each `records_per_sample`, must be
+        # byte-identical between the two paths.
+        function assert_equivalent(c, urls, ticks, probes; kw...)
+            for rps in (nothing, 1, 2)
+                p, r = push_ref(c, urls, ticks; records_per_sample = rps, kw...)
+                @test EarthSciIO._records_pushdown(p)      # the pushdown is really on
+                @test !EarthSciIO._records_pushdown(r)     # ...and really off here
+                for t in probes
+                    @test same_native(materialize(p, t), materialize(r, t))
+                end
+            end
+        end
+
+        u4a = "https://data.earthsci.dev/rec/4a.nc"
+        u4b = "https://data.earthsci.dev/rec/4b.nc"
+        u3a = "https://data.earthsci.dev/rec/3a.nc"
+        u3b = "https://data.earthsci.dev/rec/3b.nc"
+
+        @testset "two 4-record files, 8-tick cadence" begin
+            c = stage([u4a => (4, 100.0, 0.0), u4b => (4, 200.0, 4.0)])
+            urls = t -> t < 4.0 ? u4a : u4b
+            ticks = collect(0.0:7.0)
+            # ticks, half-steps between them, and past the end of the cadence
+            assert_equivalent(c, urls, ticks,
+                              vcat(ticks, [0.5, 3.5, 4.5, 6.5, 50.0]); time_dim = "time")
+            # ...and the numbers themselves, so the comparison cannot pass with
+            # BOTH paths mis-bracketed. Records are base+r; file 2 is base 200.
+            p, _ = push_ref(c, urls, ticks; time_dim = "time", records_per_sample = 2)
+            @test materialize(p, 1.0)["t2m"].data[:, 1, 1] == [102.0, 103.0]  # interior
+            @test materialize(p, 3.0)["t2m"].data[:, 1, 1] == [104.0, 201.0]  # file seam
+            @test materialize(p, 3.5)["t2m"].data[:, 1, 1] == [104.0, 201.0]  # off-tick
+            @test materialize(p, 7.0)["t2m"].data[:, 1, 1] == [204.0, 204.0]  # degenerate
+            @test materialize(p, 50.0)["t2m"].data[:, 1, 1] == [204.0, 204.0] # past the end
+            @test materialize(p, 7.0)["orog"].dims == ["latitude", "longitude"]
+            # The interior bracket is a genuine SUBSET here: records 1,2 of four.
+            empty!(RECORDS_PUSHED)
+            spy = discrete_provider(c, urls, ticks; format = "netcdf-recordspy",
+                                    time_dim = "time", records_per_sample = 2)
+            @test materialize(spy, 1.0)["t2m"].data[:, 1, 1] == [102.0, 103.0]
+            @test RECORDS_PUSHED == [Dict{String,Any}("dim" => "time",
+                                                      "indices" => [1, 2])]
+        end
+
+        @testset "files of UNEQUAL length (3 then 4 records)" begin
+            # The Provider's mod1 record arithmetic assumes uniform files, so this
+            # cadence is mis-tracked by DESIGN past the seam (documented on
+            # `Provider`). The pushdown must reproduce that behaviour exactly —
+            # an optimisation may not change a number, right or wrong.
+            c = stage([u3a => (3, 100.0, 0.0), u3b => (4, 200.0, 3.0)])
+            urls = t -> t < 3.0 ? u3a : u3b
+            ticks = collect(0.0:6.0)
+            assert_equivalent(c, urls, ticks, vcat(ticks, [2.5, 3.5, 99.0]); time_dim = "time")
+        end
+
+        @testset "single-record files" begin
+            c = stage([u4a => (1, 100.0, 0.0), u4b => (1, 200.0, 1.0)])
+            urls = t -> t < 1.0 ? u4a : u4b
+            assert_equivalent(c, urls, [0.0, 1.0], [0.0, 0.5, 1.0, 9.0]; time_dim = "time")
+            p, _ = push_ref(c, urls, [0.0, 1.0]; time_dim = "time", records_per_sample = 2)
+            @test materialize(p, 0.0)["t2m"].data[:, 1, 1] == [101.0, 201.0]  # across files
+            @test materialize(p, 1.0)["t2m"].data[:, 1, 1] == [201.0, 201.0]  # degenerate
+        end
+
+        @testset "cadence longer than the file: the mod1 WRAP, one url" begin
+            # One file of three records under a constant url and a 7-tick cadence:
+            # tick 3 -> record 3, tick 4 -> record 1, so the bracket at tick 3 is
+            # the DECREASING pair [2, 0]. That is the one shape the reader cannot
+            # read as a strided slab, and it must still come back in the order
+            # asked for rather than sorted.
+            c = stage([u3a => (3, 100.0, 0.0)])
+            ticks = collect(0.0:6.0)
+            assert_equivalent(c, u3a, ticks, vcat(ticks, [5.5]); time_dim = "time")
+            p, _ = push_ref(c, u3a, ticks; time_dim = "time", records_per_sample = 2)
+            @test materialize(p, 1.0)["t2m"].data[:, 1, 1] == [102.0, 103.0]
+            @test materialize(p, 2.0)["t2m"].data[:, 1, 1] == [103.0, 101.0]  # the wrap
+            @test materialize(p, 6.0)["t2m"].data[:, 1, 1] == [101.0, 101.0]
+        end
+
+        @testset "a spatial `select` rides along unchanged" begin
+            # `select` narrows space, `records` narrows the record axis, and the
+            # two must compose without either standing in for the other.
+            c = stage([u4a => (4, 100.0, 0.0), u4b => (4, 200.0, 4.0)])
+            urls = t -> t < 4.0 ? u4a : u4b
+            ticks = collect(0.0:7.0)
+            sel = Dict("axes" => Any["all", "all", Dict("indices" => [2, 0])])
+            for rps in (1, 2)
+                p, r = push_ref(c, urls, ticks; time_dim = "time", records_per_sample = rps)
+                for t in [0.0, 3.0, 4.0, 7.0]
+                    @test same_native(materialize(p, t; select = sel),
+                                      materialize(r, t; select = sel))
+                end
+                w = materialize(p, 3.0; select = sel)
+                @test w["longitude"].data == [-88.0, -90.0]     # order given, not sorted
+                @test size(w["t2m"].data, ndims(w["t2m"].data)) == 2
+            end
+        end
     end
 
     @testset "multi-file cadence: the record is located inside its OWN file" begin

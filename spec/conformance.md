@@ -469,6 +469,19 @@ chunks out of the already-fetched blob. The reader therefore declares
   (a blob with no such `dim` does not call it and narrows nothing). The gate is
   the same as the window's: a record-selected read must be cell-for-cell
   identical to the full read sliced afterwards.
+- **One owner per record axis.** `records` is the cadence owner's option, so a
+  Provider that owns a record axis (it has a `time_dim`, and resolves each tick
+  to a file-local record itself) must **refuse** a `records` supplied by its
+  caller in `reader_options`/`reader_kwargs` rather than forward it. A
+  caller-supplied `records` narrows the axis *behind* the tick→record
+  resolution, so the tick is then located inside the already-narrowed axis: a
+  one-record `records` makes every tick `mod1(tick, 1) == 1`, so every refresh
+  returns the same record and a 2-record bracket degenerates to `[r, r]` — a
+  constant field where the model expected to interpolate. That is a silently
+  wrong number, which is never a permitted divergence, so it is an error at
+  provider construction (`registries.md` §2.1). An explicit "off" value (Julia:
+  `records = nothing`) may stay legal as an opt-out that reads the record axis
+  whole and slices afterwards — the two paths must agree cell for cell.
 - **An axis count matching no array is an error**, never a silently ignored
   selection.
 - **The decode is unchanged by the window** — CF `scale_factor`/`add_offset` in
