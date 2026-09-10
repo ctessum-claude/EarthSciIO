@@ -582,3 +582,111 @@ fn netcdf_select_refuses_a_time_subset_and_a_rank_mismatch() {
         .to_string();
     assert!(err.contains("rank"), "{err}");
 }
+
+/// The edges of the shared selection vocabulary, as the netcdf reader must
+/// implement them — every one of these is a place the three tracks could
+/// silently disagree, so each is pinned identically in the Julia and Python
+/// suites (`julia/test/test_readers.jl`, `tests/test_readers.py`).
+#[test]
+fn netcdf_select_edges_match_the_shared_vocabulary() {
+    let corpus = corpus_dir();
+    let case: Value =
+        serde_json::from_slice(&fs::read(corpus.join("cases/era5-grid-sub-tile.json")).unwrap())
+            .unwrap();
+    let blob = corpus.join(case["blob_path"].as_str().unwrap());
+    let reader = FormatRegistry::with_builtins().get("netcdf").unwrap();
+    let full = reader.read_native(&blob, &[], &Selection::All).unwrap();
+    let full_t2m = to_opt_f64(&full.variables["t2m"].data);
+
+    // A FULL-EXTENT selection is the no-selection read, exactly. Both spellings
+    // of "everything" still go down the windowed path, so this is the read that
+    // catches an off-by-one in the slab planner.
+    for axes in [
+        vec![
+            AxisSelect::All,
+            AxisSelect::Range { start: 0, stop: 3, step: 1 },
+            AxisSelect::Range { start: 0, stop: 3, step: 1 },
+        ],
+        vec![
+            AxisSelect::All,
+            AxisSelect::Indices(vec![0, 1, 2]),
+            AxisSelect::Indices(vec![0, 1, 2]),
+        ],
+    ] {
+        let got = reader
+            .read_native(&blob, &[], &Selection::Orthogonal(axes))
+            .unwrap();
+        assert_eq!(got.variables["t2m"].shape, full.variables["t2m"].shape);
+        assert_eq!(to_opt_f64(&got.variables["t2m"].data), full_t2m);
+        for c in ["latitude", "longitude", "time"] {
+            assert_eq!(
+                to_opt_f64(&got.coords[c].field.data),
+                to_opt_f64(&full.coords[c].field.data)
+            );
+        }
+    }
+
+    // This vocabulary NEVER drops a dimension: a one-index axis comes back at
+    // length 1, not squeezed away (a track that squeezed would diverge in rank).
+    for axis in [
+        AxisSelect::Indices(vec![1]),
+        AxisSelect::Range { start: 1, stop: 2, step: 1 },
+    ] {
+        let got = reader
+            .read_native(
+                &blob,
+                &[],
+                &Selection::Orthogonal(vec![AxisSelect::All, axis, AxisSelect::All]),
+            )
+            .unwrap();
+        assert_eq!(got.variables["t2m"].shape, vec![2, 1, 3]);
+        assert_eq!(got.variables["t2m"].dims, vec!["time", "latitude", "longitude"]);
+        assert_eq!(got.coords["latitude"].field.shape, vec![1]);
+    }
+
+    // An axis may legally resolve to NOTHING: a zero-length axis, KEPT in `dims`,
+    // with `data` that actually IS empty. The bounding-slab planner would happily
+    // return a non-empty buffer beside a shape declaring 0 — a field whose shape
+    // contradicts its own data.
+    for axis in [
+        AxisSelect::Indices(vec![]),
+        AxisSelect::Range { start: 1, stop: 1, step: 1 },
+        AxisSelect::Range { start: 2, stop: 0, step: 1 },
+    ] {
+        let got = reader
+            .read_native(
+                &blob,
+                &[],
+                &Selection::Orthogonal(vec![AxisSelect::All, axis, AxisSelect::All]),
+            )
+            .unwrap();
+        for v in ["t2m", "sp"] {
+            assert_eq!(got.variables[v].shape, vec![2, 0, 3]);
+            assert_eq!(got.variables[v].dims, vec!["time", "latitude", "longitude"]);
+            assert!(to_opt_f64(&got.variables[v].data).is_empty());
+        }
+        assert_eq!(got.coords["latitude"].field.shape, vec![0]);
+        assert!(to_opt_f64(&got.coords["latitude"].field.data).is_empty());
+        // ...and the axes NOT selected keep their full length.
+        assert_eq!(got.coords["longitude"].field.shape, vec![3]);
+        assert_eq!(got.coords["time"].field.shape, vec![2]);
+    }
+
+    // A range is bounds-checked like an index list: an over-long window is an
+    // error, never a silent clamp (which would have shipped `shape = [2, 98, 3]`
+    // beside 12 values).
+    for axis in [
+        AxisSelect::Range { start: 1, stop: 99, step: 1 },
+        AxisSelect::Indices(vec![5]),
+    ] {
+        let err = reader
+            .read_native(
+                &blob,
+                &[],
+                &Selection::Orthogonal(vec![AxisSelect::All, axis, AxisSelect::All]),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "{err}");
+    }
+}

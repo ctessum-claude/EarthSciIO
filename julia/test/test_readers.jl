@@ -275,6 +275,59 @@ end
     @test_throws ArgumentError read_native(reader, blob;
                                            select = Dict("axes" => Any["all", "all"]))
 
+    # A FULL-EXTENT selection must be the no-selection read, exactly — both
+    # spellings of "everything" still go down the windowed code path, so this is
+    # the read that catches an off-by-one in the slab planner.
+    for axes in (Any["all", Dict("slice" => [0, 3]), Dict("slice" => [0, 3])],
+                 Any["all", Dict("indices" => [0, 1, 2]), Dict("indices" => [0, 1, 2])])
+        everything = read_native(reader, blob; select = Dict("axes" => axes))
+        for name in ("t2m", "sp")
+            @test size(everything[name].data) == size(full[name].data)
+            @test isequal(everything[name].data, full[name].data)
+        end
+        for name in ("latitude", "longitude", "time")
+            @test everything[name].data == full[name].data
+        end
+    end
+
+    # This vocabulary NEVER drops a dimension: a one-index axis comes back at
+    # length 1, not squeezed away (a track that squeezed would diverge in rank).
+    for ax in (Dict("indices" => [1]), Dict("slice" => [1, 2]))
+        one = read_native(reader, blob; select = Dict("axes" => Any["all", ax, "all"]))
+        @test size(one["t2m"].data) == (2, 1, 3)
+        @test one["t2m"].dims == ["time", "latitude", "longitude"]
+        @test size(one["latitude"].data) == (1,)
+        @test isequal(one["t2m"].data, full["t2m"].data[:, 2:2, :])
+    end
+
+    # An axis may legally resolve to NOTHING: a zero-length axis, KEPT in `dims`.
+    # `extrema` of an empty index list would throw, and the sibling tracks return
+    # a correctly-shaped empty array here.
+    for ax in (Dict("indices" => Int[]), Dict("slice" => [1, 1]), Dict("slice" => [2, 0]))
+        none = read_native(reader, blob; select = Dict("axes" => Any["all", ax, "all"]))
+        for name in ("t2m", "sp")
+            @test size(none[name].data) == (2, 0, 3)
+            @test none[name].dims == ["time", "latitude", "longitude"]
+        end
+        @test size(none["latitude"].data) == (0,)
+        # ...and the axes NOT selected keep their full length.
+        @test size(none["longitude"].data) == (3,)
+        @test size(none["time"].data) == (2,)
+    end
+
+    # A slice is bounds-checked like an `indices` list: an over-long window is an
+    # error, never a silent clamp, and a negative bound never wraps around.
+    for ax in (Dict("slice" => [1, 99]), Dict("slice" => [-2, 3]), Dict("indices" => [5]))
+        e = try
+            read_native(reader, blob; select = Dict("axes" => Any["all", ax, "all"]))
+            nothing
+        catch err
+            err
+        end
+        @test e !== nothing
+        @test occursin("out of range", sprint(showerror, e))
+    end
+
     # Through the Provider, per-call and baked, on a reader that is NOT
     # store-backed: same blob, same cache key, only the hyperslab materialised.
     cache = Cache(LocalStore(joinpath(CORPUS, "cache")); offline = true, verify = true)

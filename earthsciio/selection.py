@@ -7,6 +7,18 @@ non-contiguous, ordered index list, returned in the order given) or
 ``{"slice": [start, stop, step?]}`` (half-open, ``step`` defaults to 1).
 **Indices are 0-based**, in every reader and every track.
 
+Two rules the three tracks must not drift on, so they live with the helpers:
+
+* every resolved index is bounds-checked — ``0 <= i < dim_len`` — for a
+  ``slice`` exactly as for an ``indices`` list. An over-long or negative
+  ``[start, stop)`` is an error, never a silent clamp and never a negative
+  wrap-around;
+* an axis may resolve to NOTHING (``{"indices": []}``, or an empty half-open
+  ``{"slice": [1, 1]}``). That is legal and yields a **zero-length axis**, kept
+  in ``dims``: a length-0 array of the right rank, not an error and not a
+  dropped dimension. (Selecting a single index likewise KEEPS the axis, at
+  length 1 — this vocabulary never drops a dimension.)
+
 These helpers live here rather than in one backend because two readers now parse
 the same vocabulary and must not drift apart: the store-backed
 :class:`~earthsciio.backends.zarr.ZarrReader`, whose selection decides which chunk
@@ -79,7 +91,20 @@ def _resolve_axis_indices(axis: Tuple, dim_len: int) -> List[int]:
         _, start, stop, step = axis
         if step < 1:
             raise ValueError(f"slice step must be >= 1, got {step}")
-        return list(range(start, stop, step))
+        out = list(range(start, stop, step))
+        # A slice is bounds-checked exactly like an explicit `indices` list: a
+        # `[start, stop)` reaching past the dimension (or a negative `start`) is
+        # an ERROR, never a silent clamp and never a negative wrap-around. The
+        # three tracks cannot agree on a clamp — numpy clamps, NCDatasets and the
+        # `netcdf-reader` slice API do not — and an over-long window that quietly
+        # returns fewer cells than asked for is a wrong number.
+        for g in out:
+            if g < 0 or g >= dim_len:
+                raise IndexError(
+                    f"slice [{start}, {stop}) by {step} reaches index {g}, out of "
+                    f"range for dimension length {dim_len}"
+                )
+        return out
     raise ValueError(f"unrecognized axis selector: {axis!r}")
 
 

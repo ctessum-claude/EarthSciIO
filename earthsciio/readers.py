@@ -81,7 +81,19 @@ def _field_from_dataarray(da: Any) -> NativeField:
     CF packing attrs (``scale_factor``/``add_offset``/``_FillValue``) are consumed
     by ``mask_and_scale`` and intentionally dropped.
     """
-    data = _finalize_numeric(da.values)
+    # The declared shape is authoritative, and it must be read BEFORE `.values`:
+    # xarray's lazy backend indexer materialises an EMPTY orthogonal selection to
+    # the wrong shape (a `{"indices": []}` window on a (2,3,3) variable yields
+    # values of shape (1,0,1), and reading `.values` replaces the lazy array so
+    # `da.shape` then reports that too). Left alone, such a field's `shape`
+    # contradicts its own `dims` and the coordinates beside it. Reshaping to the
+    # pre-read shape fixes the empty case and turns any other mismatch into a loud
+    # error rather than a silently wrong array.
+    shape = tuple(int(n) for n in da.shape)
+    values = np.asarray(da.values)
+    if values.shape != shape:
+        values = values.reshape(shape)
+    data = _finalize_numeric(values)
     dims = tuple(str(d) for d in da.dims)
     attrs = {k: da.attrs[k] for k in ("units", "calendar") if k in da.attrs}
     return NativeField(data, dims, attrs)
@@ -107,9 +119,15 @@ def _netcdf_engine() -> Optional[str]:
 
 
 def _is_cf_time(attrs: Any) -> bool:
-    """A CF time axis: ``units`` of the form ``"<step> since <reference>"``."""
+    """A CF time axis: ``units`` of the form ``"<step> since <reference>"``.
+
+    The test is a whitespace-separated token equal to ``since``, compared
+    case-INSENSITIVELY — the same rule the Rust track applies, because "hours
+    SINCE 1900-01-01" must not be a time axis in one track and a selectable
+    spatial axis in another.
+    """
     units = attrs.get("units")
-    return bool(units) and " since " in f" {str(units).strip()} "
+    return bool(units) and "since" in str(units).lower().split()
 
 
 def _netcdf_is_time_dim(ds: Any, dim: str) -> bool:
@@ -260,7 +278,15 @@ class NetCDFReader:
         * a **time** axis that is not ``"all"`` is REFUSED: record selection
           belongs to the Provider, which owns the cadence;
         * an axis count matching no array is a :class:`ValueError`, never a
-          silently ignored selection.
+          silently ignored selection;
+        * every resolved index is **bounds-checked** (``0 <= i < dim_len``) for a
+          ``slice`` exactly as for an ``indices`` list: an over-long or negative
+          ``[start, stop)`` is an :class:`IndexError`, never a silent clamp and
+          never a negative wrap-around;
+        * a **dimension is never dropped** — a one-index axis comes back at
+          length 1 — and an axis may legally select NOTHING (``{"indices": []}``,
+          or an empty half-open ``{"slice": [1, 1]}``), giving a **zero-length
+          axis** kept in ``dims`` rather than an error.
         """
         import xarray as xr  # lazy: only the netcdf path needs the heavy stack
 

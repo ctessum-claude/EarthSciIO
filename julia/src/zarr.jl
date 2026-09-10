@@ -90,6 +90,17 @@ end
 # selection with (`readers.jl`), so `"all"` / `{indices: [...]}` /
 # `{slice: [start, stop, step?]}` — 0-based, half-open slice — mean the same thing
 # whichever reader a document points at. Keep them format-neutral.
+#
+# Two rules belong to the VOCABULARY, so they bind every reader that parses it
+# (spec/conformance.md, "NetCDF decode notes"):
+#
+#   * every resolved index is bounds-checked, `0 <= i < dim_len`, for a `slice`
+#     exactly as for an `indices` list — an over-long or negative `[start, stop)`
+#     is an error, never a silent clamp and never a negative wrap-around;
+#   * an axis may resolve to NOTHING (`{indices: []}`, or an empty half-open
+#     `{slice: [1, 1]}`), which is legal and means a ZERO-LENGTH axis, kept in
+#     `dims`. Selecting a single index likewise keeps the axis, at length 1: this
+#     vocabulary never drops a dimension.
 
 # `select` (from reader_kwargs) -> the per-axis selector vector, or `nothing`.
 function _select_axes(select)
@@ -131,7 +142,19 @@ function _resolve_axis(ax, dim_len::Int)::Vector{Int}
     elseif ax[1] === :slice
         _, start, stop, step = ax
         step >= 1 || error("slice step must be >= 1, got $step")
-        return collect(start:step:(stop - 1))
+        out = collect(start:step:(stop - 1))
+        # A slice is bounds-checked exactly like an explicit `indices` list: a
+        # `[start, stop)` reaching past the dimension (or a negative `start`) is
+        # an ERROR, never a silent clamp and never a negative wrap-around. The
+        # three tracks cannot agree on a clamp (numpy clamps; NCDatasets and the
+        # Rust `netcdf-reader` slice API do not), and an over-long window that
+        # quietly returns fewer cells than asked for is a wrong number.
+        for g in out
+            (0 <= g < dim_len) || error(
+                "slice [$start, $stop) by $step reaches index $g, out of range " *
+                "for dimension length $dim_len")
+        end
+        return out
     end
     error("unrecognized axis selector: $ax")
 end

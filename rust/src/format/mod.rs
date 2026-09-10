@@ -302,7 +302,26 @@ impl AxisSelect {
                         detail: format!("slice step must be >= 1, got {step}"),
                     });
                 }
-                Ok((*start..*stop).step_by(*step).collect())
+                let out: Vec<usize> = (*start..*stop).step_by(*step).collect();
+                // A range is bounds-checked exactly like an explicit index list:
+                // a `[start, stop)` reaching past the dimension is an ERROR, never
+                // a silent clamp. The three tracks cannot agree on a clamp (numpy
+                // clamps; NCDatasets and the `netcdf-reader` slice API do not), and
+                // an over-long window that quietly returns fewer cells than asked
+                // for is a wrong number. (`usize` already rules out a negative
+                // start, which is where Python's clamp becomes a wrap-around.)
+                if let Some(&g) = out.last() {
+                    if g >= dim_len {
+                        return Err(crate::Error::Format {
+                            format: format.to_string(),
+                            detail: format!(
+                                "slice [{start}, {stop}) by {step} reaches index {g}, out of \
+                                 range for dimension length {dim_len}"
+                            ),
+                        });
+                    }
+                }
+                Ok(out)
             }
         }
     }

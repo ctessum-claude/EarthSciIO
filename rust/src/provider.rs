@@ -784,17 +784,24 @@ impl Provider {
         // Whole-file reader. The `select` reaches it too: a reader that declares
         // `supports_selection` without being store-backed (the `netcdf` one)
         // honours it at DECODE time — the same blob under the same cache key,
-        // with only the requested hyperslab materialised. One that declares
-        // neither was already refused at the call site, so `Selection::All` is
-        // the only thing it can see here.
+        // with only the requested hyperslab materialised. A reader that declares
+        // neither is a clear error, raised BEFORE the fetch — the per-call
+        // override is already refused at the call site, and a BAKED
+        // `DataSource::select` must be refused here rather than silently ignored
+        // (that is what the Julia and Python tracks do, and a selection quietly
+        // dropped is a caller reading the whole array believing it is a window).
+        if !matches!(select, Selection::All) && !self.reader.supports_selection() {
+            return Err(Error::Format {
+                format: self.loader.format.clone(),
+                detail: format!(
+                    "reader for format '{}' does not support select/pushdown",
+                    self.loader.format
+                ),
+            });
+        }
         let blob = self.fetch_blob(&url)?;
-        let effective = if self.reader.supports_selection() {
-            select
-        } else {
-            &Selection::All
-        };
         self.reader
-            .read_native(&blob.path, &self.loader.variables, effective)
+            .read_native(&blob.path, &self.loader.variables, select)
     }
 
     /// Ensure the file covering `file_anchor` is decoded into the 2-entry LRU

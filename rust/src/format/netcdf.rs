@@ -406,10 +406,16 @@ fn field_dims(vars: &[NcVariable], var: &NcVariable) -> (Vec<String>, Vec<usize>
 /// anything else — a permuted or irregular list — reads its BOUNDING slab and
 /// gathers from that. Either way the whole array is never materialised.
 ///
+/// A dimension is never DROPPED: a one-index axis stays in `dims` at length 1,
+/// and an axis that selects nothing (`Indices([])`, an empty half-open `Range`)
+/// is a legal ZERO-LENGTH axis — `read_values` short-circuits it and reads
+/// nothing, since the bounding-slab plan would otherwise return cells beside a
+/// shape declaring `0`.
+///
 /// Numeric variables only: a slab is planned over the ON-DISK dimensions, which
 /// are the field's axes for every class but [`FieldClass::Text`]. A `char`
 /// array's selection is applied by [`select_text`] instead, over the axes the
-/// decoded field actually has.
+/// decoded field actually has — including that same zero-length rule.
 struct Slab {
     info: netcdf_reader::NcSliceInfo,
     slab_shape: Vec<usize>,
@@ -457,6 +463,17 @@ fn plan_slab(var: &NcVariable, sel: Option<&DimSelection>) -> Option<Slab> {
                 });
                 slab_shape.push(len);
                 take.push((0..len).collect());
+            }
+            Some(idxs) if idxs.is_empty() => {
+                // A legal zero-length axis: an empty slab, no gather positions.
+                // `read_values` short-circuits on it and reads nothing at all.
+                selections.push(netcdf_reader::NcSliceInfoElem::Slice {
+                    start: 0,
+                    end: 0,
+                    step: 1,
+                });
+                slab_shape.push(0);
+                take.push(Vec::new());
             }
             Some(idxs) => {
                 let lo = *idxs.iter().min().unwrap_or(&0);
@@ -525,6 +542,18 @@ fn read_values(
     unpacked: bool,
 ) -> Result<(Vec<f64>, Vec<usize>)> {
     let name = var.name();
+    // An axis may legally resolve to NOTHING (`Indices([])`, or an empty half-open
+    // `Range { start: 1, stop: 1 }`): a zero-length axis, KEPT in `dims`, never an
+    // error and never a dropped dimension. Nothing is read — and it MUST be
+    // short-circuited, because the slab planner's bounding-slab read would return
+    // a non-empty buffer beside a shape declaring 0, i.e. a field whose `shape`
+    // contradicts its `data`.
+    if let Some(slab) = slab {
+        let out_shape: Vec<usize> = slab.take.iter().map(Vec::len).collect();
+        if out_shape.iter().any(|&n| n == 0) {
+            return Ok((Vec::new(), out_shape));
+        }
+    }
     let Some(slab) = slab else {
         let arr = if unpacked {
             file.read_variable_unpacked_masked(name).map_err(fmt_err)?

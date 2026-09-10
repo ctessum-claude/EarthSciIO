@@ -116,7 +116,14 @@ differently here. Applied thus:
     selection belongs to the Provider, which owns the cadence
     (`records_per_sample`), not to the reader (spec/conformance.md §3);
   * an axis count matching no array in the blob is an error rather than a
-    silently-ignored selection."""
+    silently-ignored selection;
+  * every resolved index is **bounds-checked** (`0 <= i < dim_len`) for a `slice`
+    exactly as for an `indices` list: an over-long or negative `[start, stop)` is
+    an error, never a silent clamp and never a negative wrap-around;
+  * a **dimension is never dropped** — a one-index axis comes back at length 1 —
+    and an axis may legally select NOTHING (`Dict("indices"=>[])`, or an empty
+    half-open `Dict("slice"=>[1, 1])`), giving a **zero-length axis** kept in
+    `dims` rather than an error."""
 struct NetCDFReader <: Reader end
 
 # Widened capability (spec/registries.md §2): "honours `select` without
@@ -261,6 +268,16 @@ function _netcdf_read(v, file_dims::Vector{String}, sel, raw::Bool)
         idxs = get(sel, d, nothing)
         if idxs === nothing
             ranges[i] = Colon()
+            gathers[i] = Colon()
+            continue
+        end
+        if isempty(idxs)
+            # An axis may legally resolve to NOTHING (`{"indices": []}`, or an
+            # empty half-open `{"slice": [1, 1]}`): a zero-length axis, KEPT in
+            # `dims`, never an error and never a dropped dimension. Read an empty
+            # range on it — `extrema` of an empty list would throw, and the two
+            # sibling tracks return a correctly-shaped empty array here.
+            ranges[i] = 1:0
             gathers[i] = Colon()
             continue
         end

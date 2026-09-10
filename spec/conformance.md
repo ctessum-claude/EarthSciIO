@@ -435,6 +435,40 @@ chunks out of the already-fetched blob. The reader therefore declares
   windowed read must be **cell-for-cell identical to the full read sliced
   afterwards**, which is exactly how the `era5-window-slice` case states it.
 
+Four more rules are pinned here because three independent implementations of the
+same slicing math is exactly where a silent divergence hides. They belong to the
+**vocabulary**, so they bind the store-backed `zarr` reader identically:
+
+- **Bounds** — every resolved index must satisfy `0 <= i < dim_len`, for a
+  `slice` exactly as for an `indices` list. An over-long or negative
+  `[start, stop)` is an **error** naming the index and the dimension length: never
+  a silent clamp (which returns fewer cells than the caller asked for) and never a
+  negative wrap-around (numpy's `-2` is the second-from-last cell; NCDatasets and
+  the Rust `netcdf-reader` slice API refuse it, so a clamp cannot be made to agree
+  across the three tracks anyway). Bounds are checked against the FILE dimension
+  length, before anything is read.
+- **A dimension is never dropped** — a single-index axis (`{indices: [i]}` or
+  `{slice: [i, i+1]}`) comes back at **length 1**, kept in `dims`. Rank is a
+  function of the array, never of the selection, so a track that squeezed would
+  diverge in rank from the other two.
+- **An axis may select NOTHING** — `{indices: []}`, and any empty half-open range
+  (`{slice: [1, 1]}`, or a reversed `{slice: [2, 0]}`) — and that is **legal**: a
+  **zero-length axis**, still present in `dims`, giving an array of the same rank
+  with no cells. Not an error, and emphatically not a field whose `shape` says
+  `0` while its `data` carries the cells of a bounding slab.
+- **Order and repetition are the caller's** — an `indices` list is returned in the
+  order given, duplicates included (`[2, 0]` reverses the axis; `[1, 1]` repeats
+  a cell). A reader that sorts or deduplicates fails the `permuted-order-tile`
+  case.
+
+**Precedence** — identical to the zarr reader's, in all three tracks: a per-call
+`select` (`materialize(..., select=…)` / `materialize_with_select`) **overrides**
+a baked `reader_options.select` / `DataSource::select` for that call ONLY, and is
+a projection *peek* — the cadence/file buffers keep the baked projection, so the
+next plain read returns it again. A `select` from either source aimed at a reader
+that does not answer `supports_selection` is an error raised **before any fetch**,
+whether it arrived per-call or baked.
+
 ### Zarr decode notes (store-backed reader)
 
 The `zarr` reader is **store-backed**: a Zarr v2 store is not one blob, so the
