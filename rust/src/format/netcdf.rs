@@ -73,6 +73,10 @@ impl Reader for NetcdfReader {
     /// `netcdf-reader` slice API reads just the intersecting chunks). NOT
     /// `store_backed` — the download is unchanged, and that pair is how a caller
     /// tells the two kinds of selection apart.
+    ///
+    /// A text field is the one exception to the hyperslab, and only to it: the
+    /// VALUES are the same either way, but they are gathered after a whole read
+    /// rather than sliced during one ([`select_text`] says why).
     fn supports_selection(&self) -> bool {
         true
     }
@@ -92,7 +96,10 @@ fn is_time_dim(vars: &[NcVariable], dim: &str) -> bool {
     for v in vars {
         if v.name() == dim {
             if let Some(units) = att_text(v, "units") {
-                if units.split_whitespace().any(|w| w.eq_ignore_ascii_case("since")) {
+                if units
+                    .split_whitespace()
+                    .any(|w| w.eq_ignore_ascii_case("since"))
+                {
                     return true;
                 }
             }
@@ -550,7 +557,7 @@ fn read_values(
     // contradicts its `data`.
     if let Some(slab) = slab {
         let out_shape: Vec<usize> = slab.take.iter().map(Vec::len).collect();
-        if out_shape.iter().any(|&n| n == 0) {
+        if out_shape.contains(&0) {
             return Ok((Vec::new(), out_shape));
         }
     }
@@ -809,7 +816,7 @@ fn select_text(
     // A legal zero-length axis reads NOTHING; `gather` would otherwise be asked
     // for a product of zero cells out of a full array, which is harmless but
     // says less about the intent than short-circuiting does.
-    if out_shape.iter().any(|&n| n == 0) {
+    if out_shape.contains(&0) {
         return Ok((Vec::new(), out_shape));
     }
     Ok((gather(&values, &shape, &take), out_shape))
@@ -841,6 +848,7 @@ fn fmt_err(e: netcdf_reader::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::AxisSelect;
     use std::io::Write;
 
     /// Decode an in-memory blob by staging it to a temp file (the reader opens a
@@ -855,6 +863,54 @@ mod tests {
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         NetcdfReader::new().read_native(f.path(), variables, &Selection::All)
+    }
+
+    /// As [`read_bytes`], under a decode-time `select` of `axes`.
+    fn read_bytes_select(bytes: &[u8], axes: Vec<AxisSelect>) -> Result<NativeDataset> {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        NetcdfReader::new().read_native(f.path(), &[], &Selection::Orthogonal(axes))
+    }
+
+    /// Stage a blob and open it. The `NamedTempFile` is returned because the
+    /// reader memory-maps the path: dropping it would unlink the file underneath
+    /// the open `NcFile`.
+    fn open_blob(bytes: &[u8]) -> (tempfile::NamedTempFile, NcFile) {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        let file = NcFile::open(f.path()).expect("a readable blob");
+        (f, file)
+    }
+
+    /// Decode with a HAND-BUILT `{dimension: indices}` map, bypassing the
+    /// positional axis matching. [`dim_selection`] cannot produce a consumed
+    /// string-length dimension — that is what [`field_dims`] is for — so the
+    /// guard against one is unreachable through `read_native`; this reaches it,
+    /// so the guard is tested rather than merely asserted in a comment.
+    fn decode_with_dim_selection(
+        bytes: &[u8],
+        sel: &[(&str, Vec<usize>)],
+    ) -> Result<NativeDataset> {
+        let (_keep, file) = open_blob(bytes);
+        let map: DimSelection = sel
+            .iter()
+            .map(|(d, idx)| ((*d).to_string(), idx.clone()))
+            .collect();
+        decode(&file, &[], Some(&map))
+    }
+
+    /// The `value` field of a decode, as `(dims, shape, floats)`.
+    fn value_of(ds: &NativeDataset) -> (Vec<String>, Vec<usize>, Vec<f64>) {
+        let f = ds.variables.get("value").expect("a `value` field");
+        let ArrayData::F64(vals) = &f.data else {
+            panic!(
+                "a float variable must carry ArrayData::F64, got {:?}",
+                f.data
+            )
+        };
+        (f.dims.clone(), f.shape.clone(), vals.clone())
     }
 
     /// The `label` field of a decode, as `(dims, shape, strings)`.
@@ -1033,6 +1089,185 @@ mod tests {
             msg.contains("label"),
             "error must list what IS present: {msg}"
         );
+    }
+
+    // ---- text × selection -------------------------------------------------
+    //
+    // A `select` is applied by dimension NAME to every array and every
+    // coordinate, so a `char` variable is not exempt from it. The two features
+    // meet at the string-length dimension a `char` array CONSUMES: it is not an
+    // axis of the decoded field, so it must neither be selectable nor count
+    // towards the positional rank match. Both halves are pinned below, because
+    // getting the second one wrong would quietly rebind the selectors of every
+    // NUMERIC variable in the same file.
+
+    /// A `char label(n)` sharing its axis with `float value(n)` is windowed
+    /// along `n` like any other array: the two must lose the SAME cells, in the
+    /// same order, or they come back describing different rows of the file.
+    #[test]
+    fn a_select_windows_a_char_variable_on_its_shared_axis() {
+        let ds = read_bytes_select(CHAR_VAR_CDF1, vec![AxisSelect::Indices(vec![2, 0])])
+            .expect("a select over the shared axis");
+
+        let (dims, shape, vals) = label_of(&ds);
+        assert_eq!(dims, ["n"], "a windowed axis is never dropped");
+        assert_eq!(shape, [2]);
+        assert_eq!(vals, ["c", "a"], "in the order asked for, not sorted");
+
+        let (vdims, vshape, vvals) = value_of(&ds);
+        assert_eq!(vdims, ["n"]);
+        assert_eq!(vshape, [2]);
+        assert_eq!(
+            vvals,
+            [3.0, 1.0],
+            "the numeric neighbour loses the same rows"
+        );
+    }
+
+    /// A `char label(n, strlen)` on a PRIVATE `strlen` is windowed along `n` —
+    /// its STRINGS are selected, whole. The failure this pins is truncation: a
+    /// reader that planned the window over the on-disk dims would slice the
+    /// string-length axis too and hand back `"ef"` for `"efgh"`, a wrong string
+    /// rather than a wrong count, which no assertion on `shape` would catch.
+    #[test]
+    fn a_select_windows_the_strings_not_their_characters() {
+        let ds = read_bytes_select(STRING_ROWS_CDF1, vec![AxisSelect::Indices(vec![2, 0])])
+            .expect("a select over `n`");
+
+        let (dims, shape, vals) = label_of(&ds);
+        assert_eq!(dims, ["n"], "`strlen` is still consumed under a select");
+        assert_eq!(shape, [2]);
+        assert_eq!(
+            vals,
+            ["efgh", "ab"],
+            "whole strings, in the order asked for"
+        );
+
+        assert_eq!(value_of(&ds).2, [3.0, 1.0]);
+    }
+
+    /// The rank a variable offers the positional match is its FIELD's, not its
+    /// on-disk dimension count. `STRING_ROWS_CDF1` holds a rank-1 `value(n)` and
+    /// a `char label(n, strlen)` that is a rank-1 FIELD on two on-disk
+    /// dimensions, so nothing in the blob has rank 2 and a 2-axis `select` is
+    /// the "matches no array" error — not a match against `label` that would
+    /// bind axis 1 to a string length.
+    #[test]
+    fn a_consumed_string_length_never_makes_an_axis_count_match() {
+        let err = read_bytes_select(
+            STRING_ROWS_CDF1,
+            vec![AxisSelect::All, AxisSelect::Indices(vec![0])],
+        )
+        .expect_err("a char variable's consumed dimension must not answer for rank 2");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no variable in the blob has rank 2"),
+            "the error must say the axis count matched nothing: {msg}"
+        );
+    }
+
+    /// ...and the same rule stops a selector BINDING to a string length. In
+    /// `SCALAR_STRING_CDF1` the `char label(strlen)` is a rank-1 array on disk
+    /// and a rank-0 FIELD, so a 1-axis `select` may match `value(n)` only. Were
+    /// the on-disk rank counted, `strlen` would bind the very same selector as
+    /// `n` and the scalar string `"hi"` would come back sliced to `"h"` — a
+    /// wrong string produced by a selection the caller aimed at `n`.
+    #[test]
+    fn a_consumed_string_length_is_not_an_axis_a_selector_can_bind_to() {
+        let ds = read_bytes_select(SCALAR_STRING_CDF1, vec![AxisSelect::Indices(vec![0, 2])])
+            .expect("a 1-axis select binds `n`, the only rank-1 field's dim");
+
+        let (dims, shape, vals) = label_of(&ds);
+        assert!(dims.is_empty(), "a scalar string stays scalar: {dims:?}");
+        assert!(shape.is_empty(), "…and shapeless: {shape:?}");
+        assert_eq!(vals, ["hi"], "the whole string, not a selected character");
+
+        assert_eq!(value_of(&ds).2, [1.0, 3.0], "`n` was windowed as asked");
+    }
+
+    /// The guard behind that invariant. `dim_selection` cannot name a consumed
+    /// string length (the test above is why), so this reaches the decode with a
+    /// hand-built map instead: naming one is an ERROR. Silently ignoring it
+    /// would hand back the full array while the caller believes it asked for a
+    /// window, and honouring it would truncate every string — this repo's rules
+    /// exist to prevent exactly that pair of outcomes.
+    #[test]
+    fn a_selection_naming_a_consumed_string_length_is_an_error() {
+        let err = decode_with_dim_selection(STRING_ROWS_CDF1, &[("strlen", vec![0, 1])])
+            .expect_err("a string length is not a selectable axis");
+        let msg = err.to_string();
+        assert!(msg.contains("strlen"), "the error must name it: {msg}");
+        assert!(msg.contains("label"), "…and the variable: {msg}");
+        assert!(
+            msg.contains("string") && msg.contains("truncate"),
+            "…and say why it is refused rather than applied: {msg}"
+        );
+    }
+
+    /// A zero-length axis is legal for a text field too: an empty half-open
+    /// `[1, 1)` keeps `n` in `dims` at length 0 and selects no strings. The
+    /// failure mode is a field whose `shape` says `0` while its `data` still
+    /// carries cells, which is what an unguarded gather would produce.
+    #[test]
+    fn an_empty_axis_is_legal_for_a_text_field_too() {
+        let ds = read_bytes_select(
+            STRING_ROWS_CDF1,
+            vec![AxisSelect::Range {
+                start: 1,
+                stop: 1,
+                step: 1,
+            }],
+        )
+        .expect("an empty half-open range is a legal zero-length axis");
+
+        let (dims, shape, vals) = label_of(&ds);
+        assert_eq!(dims, ["n"], "a zero-length axis is KEPT in dims");
+        assert_eq!(shape, [0]);
+        assert!(vals.is_empty(), "shape 0 must mean no cells, got {vals:?}");
+
+        let (vdims, vshape, vvals) = value_of(&ds);
+        assert_eq!(vdims, ["n"]);
+        assert_eq!(vshape, [0]);
+        assert!(vvals.is_empty(), "the numeric field agrees: {vvals:?}");
+    }
+
+    /// The highest-severity thing this merge could have broken: teaching
+    /// `dim_selection` to match on FIELD rank must not move which dimension a
+    /// selector binds to for a NON-text variable. It cannot, and this is the
+    /// proof rather than the claim — [`field_dims`] is the identity on every
+    /// variable that is not a `char` array with a consumed last dimension, so
+    /// for every other variable in every fixture here the rank it offers, the
+    /// dim names it offers and their lengths are `var.dimensions()` verbatim.
+    #[test]
+    fn field_dims_is_the_identity_for_a_non_text_variable() {
+        for blob in [
+            CHAR_VAR_CDF1,
+            CHAR_HOLES_CDF1,
+            STRING_ROWS_CDF1,
+            SCALAR_STRING_CDF1,
+        ] {
+            let (_keep, file) = open_blob(blob);
+            let vars: Vec<NcVariable> = file.variables().unwrap().to_vec();
+            let mut checked = 0;
+            for var in &vars {
+                if matches!(var.dtype(), NcType::Char | NcType::String) {
+                    continue;
+                }
+                let (dims, shape) = field_dims(&vars, var);
+                let on_disk: Vec<String> =
+                    var.dimensions().iter().map(|d| d.name.clone()).collect();
+                let sizes: Vec<usize> = var.dimensions().iter().map(|d| d.size as usize).collect();
+                assert_eq!(dims, on_disk, "{} lost or gained a dim", var.name());
+                assert_eq!(shape, sizes, "{} lost or gained a length", var.name());
+                assert!(
+                    consumed_length_dim(&vars, var).is_none(),
+                    "{} is not a char array and consumes nothing",
+                    var.name()
+                );
+                checked += 1;
+            }
+            assert!(checked > 0, "every fixture has a numeric variable to check");
+        }
     }
 
     #[test]

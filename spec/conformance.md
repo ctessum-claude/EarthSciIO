@@ -136,7 +136,11 @@ Every reader MUST decode identically, or cross-language equality fails. Pinned:
   bytes. **Julia (NCDatasets) does not yet follow it** — it returns a raw `Char`
   array of the full on-disk shape, so a 2-D `char` variable comes back as an
   `n × strlen` matrix rather than `n` strings. That is an open divergence, not a
-  sanctioned one.
+  sanctioned one. It has a second face under a `select`: because that Julia field
+  keeps its string-length dimension, it still counts as **rank 2** for the
+  positional axis match the selection notes below require to be over decoded
+  fields. Both faces close together, when the Julia reader learns the
+  convention — the rule below is the one all three tracks are held to.
 - **FF10 zip member selection** — an `ff10` blob may be a `.zip`; the reader's
   `member` (singular), `members` (explicit list), and `member_glob`
   (fnmatch-style `*`/`?`/`[...]`, case-sensitive, matched against the full
@@ -417,7 +421,22 @@ chunks out of the already-fetched blob. The reader therefore declares
 - **Axis order and base** — the axes are **positional over FILE-order dims** —
   the order `dims` reports, `[time, lev, lat, lon]` for a GEOS-FP A3dyn variable,
   which the Julia track reaches by permuting NCDatasets' reversed arrays back —
-  of every array whose **rank equals the axis count** (the zarr rule).
+  of every array whose **rank equals the axis count** (the zarr rule). "Array"
+  means the **decoded field**, so the rank counted is the one the field reports,
+  never a variable's on-disk dimension count where the two differ.
+- **A text variable is not exempt, and a string LENGTH is not an axis** — the
+  induced map is applied by name to `char`/`NC_STRING` fields like any other, so
+  a `char label(n)` beside a `float value(n)` loses exactly the cells `value`
+  loses, in the same order. But a **consumed** string-length dimension (the one
+  the character-array convention above folds away) is not an axis of the decoded
+  field: `char label(n, strlen)` is a **rank-1** field, so it answers a 1-axis
+  `select` on `n` and never a 2-axis one, and no selector can bind to `strlen`.
+  A selection that names a consumed string length is an **error**, never
+  silently ignored and never applied — applying it would slice *characters*,
+  handing back `"ef"` for `"efgh"`: a wrong string, which is no more permitted
+  than a wrong number. (This falls out for free in Python, where xarray's
+  decoded `ds.variables` already have the dimension consumed; Rust matches ranks
+  over its decoded fields for the same reason.)
 - **Applied by dimension NAME** — those axes induce a dimension → selector map,
   which is applied to every other array **and to the coordinate fields**. A
   windowed variable beside a full-length `lon`/`lat` would be a silent trap, and
