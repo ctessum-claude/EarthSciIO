@@ -49,7 +49,14 @@ echo "[1/4] Python provider dump  -> $OUT/python.json"
 python3 conformance/dumpers/dump_python.py "$OUT/python.json"
 
 echo "[2/4] Julia provider dump   -> $OUT/julia.json"
-julia --project=julia conformance/dumpers/dump_julia.jl "$OUT/julia.json"
+# EarthSciIO's decode backends for zarr/shapefile/parquet/geotiff are weakdep
+# EXTENSIONS, so they are not importable under a bare `--project=julia`. Resolve
+# them WITH EarthSciIO's own deps into one environment and run the dumper there;
+# stacking a separately-resolved env onto LOAD_PATH mixes the two manifests and
+# breaks precompilation (conformance/dumpers/julia_env.jl explains the case that
+# fired). Warm environment => no resolve and no network.
+JULIA_ENV="$(julia conformance/dumpers/julia_env.jl)"
+julia --project="$JULIA_ENV" conformance/dumpers/dump_julia.jl "$OUT/julia.json"
 
 echo "[3/4] Rust provider dump    -> $OUT/rust.json"
 cargo run --quiet --manifest-path rust/Cargo.toml --example conformance_dump -- "$OUT/rust.json"

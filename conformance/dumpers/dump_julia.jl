@@ -15,66 +15,49 @@
 # is `null` (== NaN); strings are emitted verbatim. A case whose `format` has no
 # active reader in this track is `status="skipped"` (explicit, never dropped).
 #
-# Usage:  julia --project=julia conformance/dumpers/dump_julia.jl [out.json]
+# Usage:  julia --project="$(julia conformance/dumpers/julia_env.jl)" \
+#             conformance/dumpers/dump_julia.jl [out.json]
+#         (`conformance/run_conformance.sh` does both steps.)
 
 using EarthSciIO
 import JSON
 
-# The store-backed `zarr` case decodes blosc chunks via the `EarthSciIOBloscExt`
-# weakdep extension (`using Blosc`), and the store-backed `shapefile` case via
-# `EarthSciIOShapefileExt` (`using Shapefile`). Both are weakdeps (light base install,
-# mirroring TiffImages), so it is not importable under `--project=julia`; add it
-# to a temporary environment stacked on LOAD_PATH and retry the extension load.
-# In an env that already carries Blosc (e.g. the test target) the direct import
-# succeeds and this is a no-op. Requires network only if Blosc is not yet in the
-# depot.
-import Pkg
-
-# Resolve `pkg` into a temp environment stacked on LOAD_PATH. Tried OFFLINE
-# first — the harness's whole claim is that it touches no network, and a depot
-# populated by `Pkg.instantiate()` already holds every weakdep — and only then
-# with the network, so a fresh depot still works (that fallback is the one step
-# of the run that can reach out).
-function _add_offline_first(pkg::String)
-    was = get(ENV, "JULIA_PKG_OFFLINE", nothing)
-    try
-        ENV["JULIA_PKG_OFFLINE"] = "true"
-        Pkg.add(pkg; io = devnull)
-    catch
-        delete!(ENV, "JULIA_PKG_OFFLINE")
-        Pkg.add(pkg; io = devnull)
-    finally
-        was === nothing ? delete!(ENV, "JULIA_PKG_OFFLINE") : (ENV["JULIA_PKG_OFFLINE"] = was)
-    end
-end
-
-function _load_weakdep(extname::Symbol, pkg::String)
+# Four of the corpus formats decode through weakdep EXTENSIONS: `zarr` through
+# `EarthSciIOBloscExt` (`Blosc`), `shapefile` through `EarthSciIOShapefileExt`,
+# `parquet` through `EarthSciIOParquet2Ext`, `geotiff` through
+# `EarthSciIOTiffImagesExt`. They are `[weakdeps]` of `julia/Project.toml` (a
+# base install stays light), so they are NOT importable under `--project=julia`.
+#
+# This dumper therefore runs in the environment `dumpers/julia_env.jl` prepares,
+# where EarthSciIO and every one of its weakdeps are resolved TOGETHER and a
+# plain import just works. It deliberately does NOT resolve anything itself: the
+# fallback that used to live here — a throwaway env pushed onto `LOAD_PATH` —
+# looks harmless and is not, because Julia resolves a stacked package's
+# dependencies through the PRIMARY environment's manifest and the two
+# independent resolutions silently mix (see `julia_env.jl` for the case that
+# fired: WeakRefStrings built against the primary `Parsers`). A missing weakdep
+# is a setup error, and says so.
+function _load_ext(extname::Symbol, pkg::String)
     Base.get_extension(EarthSciIO, extname) === nothing || return
     try
         @eval import $(Symbol(pkg))
-    catch
-        _juliaproj = normpath(joinpath(@__DIR__, "..", "..", "julia"))
-        _env = mktempdir()
-        Pkg.activate(_env; io = devnull)
-        _add_offline_first(pkg)
-        Pkg.activate(_juliaproj; io = devnull)
-        push!(LOAD_PATH, _env)
-        @eval import $(Symbol(pkg))
+    catch err
+        error("""
+              cannot import `$pkg`, the trigger for EarthSciIO's `$extname`.
+              Run this dumper in the prepared conformance environment:
+                  julia --project="\$(julia conformance/dumpers/julia_env.jl)" $(basename(@__FILE__)) ...
+              or just run conformance/run_conformance.sh.
+              active project: $(Base.active_project())
+              underlying: $err
+              """)
     end
     Base.retry_load_extensions()
 end
 
-_load_weakdep(:EarthSciIOBloscExt, "Blosc")
-# The `shapefile` case decodes through the `EarthSciIOShapefileExt` weakdep
-# extension (`using Shapefile`) — the same bootstrap as Blosc above.
-_load_weakdep(:EarthSciIOShapefileExt, "Shapefile")
-# The `parquet` case decodes through the `EarthSciIOParquet2Ext` weakdep
-# extension (`using Parquet2`) — the same bootstrap again.
-_load_weakdep(:EarthSciIOParquet2Ext, "Parquet2")
-# The `geotiff` case decodes through `EarthSciIOTiffImagesExt` (`using
-# TiffImages`), the Julia peer of the Python reader's tifffile backend and the
-# Rust `tiff` crate — same bootstrap again.
-_load_weakdep(:EarthSciIOTiffImagesExt, "TiffImages")
+_load_ext(:EarthSciIOBloscExt, "Blosc")
+_load_ext(:EarthSciIOShapefileExt, "Shapefile")
+_load_ext(:EarthSciIOParquet2Ext, "Parquet2")
+_load_ext(:EarthSciIOTiffImagesExt, "TiffImages")
 
 # Row-major (C-order) flatten of a native array whose axes are in file (`dims`)
 # order — matches numpy `.reshape(-1)` on the Python track's arrays.

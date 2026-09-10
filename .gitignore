@@ -9,6 +9,11 @@ venv/
 *.part
 .tmp_*
 
+# The Julia conformance environment: EarthSciIO + its weakdeps in ONE resolution,
+# built by conformance/dumpers/julia_env.jl. A build product like
+# julia/Manifest.toml — regenerated from Project.toml, never committed.
+/conformance/.julia-env/
+
 # Local cache root (real $EARTHSCIDATADIR is on /scratch.local, never committed;
 # the conformance corpus under conformance/corpus/cache/ is committed on purpose)
 /earthsci-cache/

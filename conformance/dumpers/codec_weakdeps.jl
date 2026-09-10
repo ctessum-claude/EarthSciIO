@@ -13,36 +13,33 @@
 #                    `wasm32-unknown-unknown`), while the standard v3 `zstd` codec
 #                    is pure Rust there.
 #
-# Both are loaded here so ONE write/read driver covers every codec profile. The
-# strategy per package mirrors what the dumpers have always done for Blosc: try a
-# direct import (it works when the package is already resolvable, e.g. via a
-# stacked env or the test target); on failure stack a temp env carrying it onto
-# LOAD_PATH and retry. `Base.retry_load_extensions()` then activates the
-# extensions.
+# Both are loaded here so ONE write/read driver covers every codec profile.
+#
+# Neither is importable under a bare `--project=julia` — they are `[weakdeps]`,
+# and `Pkg.instantiate()` does not install those. The write drivers therefore run
+# in the environment `dumpers/julia_env.jl` prepares, where EarthSciIO and every
+# one of its weakdeps are resolved TOGETHER, and a plain import just works.
+#
+# This deliberately no longer falls back to resolving the package into a
+# throwaway environment pushed onto `LOAD_PATH`. That fallback mixes two
+# independent resolutions — Julia resolves a stacked package's dependencies
+# through the PRIMARY environment's manifest — and it broke the read harness
+# outright once the graphs diverged (`julia_env.jl` has the case). It worked here
+# only because Blosc's and CodecZstd's dependency graphs happen not to overlap
+# EarthSciIO's; that is luck, not a design.
 
 function _load_weakdep!(name::AbstractString)
     try
         @eval import $(Symbol(name))
         return true
-    catch
-        try
-            juliaproj = normpath(joinpath(@__DIR__, "..", "..", "julia"))
-            env = mktempdir()
-            # Each statement gets its OWN `@eval` so it runs in the latest world
-            # age: under Julia >= 1.12 touching the `Pkg` binding in the same
-            # block that imported it is a prior-world access (a hard error in
-            # future versions, a loud warning today).
-            @eval import Pkg
-            @eval Pkg.activate($env; io = devnull)
-            @eval Pkg.add($name; io = devnull)
-            @eval Pkg.activate($juliaproj; io = devnull)
-            push!(LOAD_PATH, env)
-            @eval import $(Symbol(name))
-            return true
-        catch err
-            @warn "could not load codec weakdep $name; stores using it will fail" err
-            return false
-        end
+    catch err
+        @warn """
+              cannot import codec weakdep $name; stores using it will fail.
+              Run this driver in the prepared conformance environment:
+                  julia --project="\$(julia conformance/dumpers/julia_env.jl)" ...
+              or just run conformance/run_write_conformance.sh.
+              """ active_project = Base.active_project() err
+        return false
     end
 end
 

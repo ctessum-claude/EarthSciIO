@@ -15,6 +15,7 @@ corpus — so no FFI is needed.*
 conformance/
   dumpers/dump_python.py        # drives earthsciio.Provider          -> native-dump/v1
   dumpers/dump_julia.jl         # drives EarthSciIO.const_provider     -> native-dump/v1
+  dumpers/julia_env.jl          # builds the ONE env the Julia drivers run in
   ../rust/examples/conformance_dump.rs  # drives earthsciio::Provider  -> native-dump/v1
   crosscheck.py                 # asserts equality: vs oracle, pairwise, coverage
   run_conformance.sh            # driver: run all 3 dumpers + crosscheck (the gate)
@@ -29,9 +30,30 @@ conformance/
 
 Needs the three toolchains: Python
 (`pip install -e ".[netcdf,shapefile,zarr,geotiff,test]"` — one extra per corpus
-format, `zarr` needs Python ≥3.11), Julia
-(`julia --project=julia -e 'using Pkg; Pkg.instantiate()'`), Rust (`cargo`). Exit
+format, `zarr` needs Python ≥3.11), Julia (nothing to do by hand — the driver
+runs [`dumpers/julia_env.jl`](dumpers/julia_env.jl) first), Rust (`cargo`). Exit
 0 ⇔ every decoding track agrees with the oracle and pairwise with the others.
+
+### The Julia environment
+
+EarthSciIO keeps its `zarr` / `shapefile` / `parquet` / `geotiff` decode backends
+in weakdep **extensions**, so `--project=julia` cannot import them and
+`Pkg.instantiate()` does not install them.
+[`dumpers/julia_env.jl`](dumpers/julia_env.jl) prepares one environment —
+gitignored under `conformance/.julia-env`, rebuilt only when
+`julia/Project.toml` or the Julia version changes — in which EarthSciIO (deved
+from this working tree) **and** every weakdep are resolved in a SINGLE pass, and
+every Julia driver runs there.
+
+One pass is the whole point. Resolving a weakdep into its own environment and
+pushing that onto `LOAD_PATH` is not equivalent: Julia resolves a stacked
+package's dependencies by walking `LOAD_PATH` in order, so the *primary*
+environment answers first and the two manifests silently mix. On Julia 1.10 that
+built `WeakRefStrings` (which needs `Parsers` 2) against the primary
+environment's `Parsers` 3 and the harness died in precompilation — a conflict on
+a transitive dependency `julia/Project.toml` names no bound for, so no amount of
+`[compat]` copying could have fixed it. `Pkg.test` gets this right for free by
+resolving `[targets] test` in one pass; this is the harness's equivalent.
 
 ## How it works
 
@@ -199,6 +221,7 @@ conformance/
   write_spec_wasm.json           # shared input spec, `wasm` profile (same data)
   gen_write_spec.py              # deterministic regenerator for both spec variants
   dumpers/codec_weakdeps.jl      # loads the Blosc + CodecZstd weakdep extensions
+  dumpers/julia_env.jl           # builds the ONE env the Julia drivers run in
   dumpers/write_python.py        # drives earthsciio.backends.zarr_write.ZarrWriter -> store
   dumpers/write_julia.jl         # drives EarthSciIO.ZarrWriter (reference)         -> store
   ../rust/examples/conformance_write.rs  # drives earthsciio::write_zarr_v3         -> store
@@ -352,9 +375,9 @@ wasm        rust    ['bytes','zstd']  level=5 checksum=False
   that fork is absent, `cargo` skips with a logged reason and the gate runs on the
   tracks that built. The `wasm` profile needs **no new crate dependency**: `zarrs`'
   default feature set already includes the pure-Rust-friendly `zstd` codec.
-* **Julia** uses the minimal `--project=julia` env. The writer/reader load their
-  codec weakdeps through `dumpers/codec_weakdeps.jl`: `Blosc`
-  (→ `EarthSciIOBloscExt`) for the Blosc profiles and `CodecZstd`
-  (→ `EarthSciIOZstdExt`) for `wasm`. Each is tried as a direct import first and
-  falls back to a temp env stacked onto `LOAD_PATH`, so a checkout without them in
-  the active project still runs.
+* **Julia** runs in the environment `dumpers/julia_env.jl` prepares (see *The
+  Julia environment* above), where EarthSciIO and all of its weakdeps are
+  resolved in one pass. `dumpers/codec_weakdeps.jl` then just imports the two the
+  writer/reader need — `Blosc` (→ `EarthSciIOBloscExt`) for the Blosc profiles
+  and `CodecZstd` (→ `EarthSciIOZstdExt`) for `wasm` — and warns, naming the
+  environment, if one is missing.

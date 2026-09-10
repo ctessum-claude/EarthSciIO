@@ -69,6 +69,15 @@ echo
 have_python_zarr=0
 if "$PYTHON" -c 'import zarr' >/dev/null 2>&1; then have_python_zarr=1; fi
 have_julia=0; if command -v "$JULIA" >/dev/null 2>&1; then have_julia=1; fi
+# The Julia drivers encode/decode chunks through weakdep EXTENSIONS (Blosc,
+# CodecZstd), which `--project=julia` cannot import. Resolve them WITH
+# EarthSciIO's own deps into one environment and run the drivers there — a
+# separately-resolved env stacked onto LOAD_PATH mixes manifests and breaks
+# precompilation (conformance/dumpers/julia_env.jl). Warm env => no network.
+JULIA_ENV=""
+if [ "$have_julia" = 1 ]; then
+  JULIA_ENV="$("$JULIA" conformance/dumpers/julia_env.jl)"
+fi
 have_cargo=0; if command -v "$CARGO" >/dev/null 2>&1; then have_cargo=1; fi
 
 # Build the Rust example ONCE up front (rather than per profile) so a build
@@ -122,7 +131,7 @@ for PROFILE in $PROFILES; do
 
   if [ "$have_julia" = 1 ]; then
     echo "[write] julia -> $POUT/store_julia"
-    "$JULIA" --project=julia conformance/dumpers/write_julia.jl "$POUT/store_julia" "$SPEC"
+    "$JULIA" --project="$JULIA_ENV" conformance/dumpers/write_julia.jl "$POUT/store_julia" "$SPEC"
     WRITERS+=(julia); STORE_ARGS+=(--store "julia=$POUT/store_julia")
   else
     echo "[write] julia SKIPPED: '$JULIA' not found"
@@ -146,7 +155,7 @@ for PROFILE in $PROFILES; do
     fi
     if [ "$have_julia" = 1 ]; then
       echo "[read ] julia reader over $w store"
-      "$JULIA" --project=julia conformance/dumpers/read_julia.jl \
+      "$JULIA" --project="$JULIA_ENV" conformance/dumpers/read_julia.jl \
         "$POUT/store_$w" "$w" "$POUT/rd_julia_from_$w.json" "$SPEC"
       READBACKS+=("$POUT/rd_julia_from_$w.json")
     fi

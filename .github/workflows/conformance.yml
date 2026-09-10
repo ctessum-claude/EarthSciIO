@@ -57,8 +57,16 @@ jobs:
         with:
           version: "1.10"
       - uses: julia-actions/cache@v2
-      - name: Instantiate Julia track
-        run: julia --project=julia -e 'using Pkg; Pkg.instantiate()'
+      # EarthSciIO keeps its zarr/shapefile/parquet/geotiff decode backends in
+      # weakdep EXTENSIONS, so `Pkg.instantiate()` on `julia/Project.toml` does
+      # NOT install them and a bare `--project=julia` cannot import them. Resolve
+      # them together with EarthSciIO's own deps into one environment here, with
+      # the network still allowed, so the gate below runs offline against a warm
+      # environment. They must be ONE resolution: a separately-resolved env
+      # stacked onto LOAD_PATH mixes manifests and fails to precompile (see
+      # conformance/dumpers/julia_env.jl).
+      - name: Prepare the Julia conformance environment (EarthSciIO + its weakdeps)
+        run: julia conformance/dumpers/julia_env.jl
 
       # --- Rust track ------------------------------------------------------ #
       - name: Set up Rust

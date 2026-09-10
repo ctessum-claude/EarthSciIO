@@ -16,7 +16,9 @@
 # `zstd` DECode (what the `wasm` output profile writes) rides `EarthSciIOZstdExt`.
 # Loading BOTH means this one driver cross-reads every codec profile variant.
 #
-# Usage:  julia --project=julia conformance/dumpers/read_julia.jl STORE_DIR WRITER_LABEL [OUT.json] [SPEC.json]
+# Usage:  julia --project="$(julia conformance/dumpers/julia_env.jl)" \
+#             conformance/dumpers/read_julia.jl STORE_DIR WRITER_LABEL [OUT.json] [SPEC.json]
+#         (`conformance/run_write_conformance.sh` does both steps.)
 
 using EarthSciIO
 import JSON
