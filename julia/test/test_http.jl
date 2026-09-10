@@ -158,7 +158,7 @@ end
                 "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
             EarthSciIO._reset_http_downloader!()
             r = EarthSciIO.fetch!(EarthSciIO.HttpTransport(),
-                                  "http://localhost:$port/slow.bin", dest)
+                                  "http://127.0.0.1:$port/slow.bin", dest)
             @test r.status == :downloaded
         end
         @test read(dest) == payload
@@ -197,9 +197,116 @@ end
                 "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
             EarthSciIO._reset_http_downloader!()
             @test_throws Exception EarthSciIO.fetch!(
-                EarthSciIO.HttpTransport(), "http://localhost:$port/wedged.bin", dest)
+                EarthSciIO.HttpTransport(), "http://127.0.0.1:$port/wedged.bin", dest)
         end
         @test time() - t0 < 15    # 2 attempts x 1 s cap + backoff, not 6 extensions
+    finally
+        close(server); rm(dest; force = true)
+        EarthSciIO._reset_http_downloader!()
+    end
+end
+
+# --- progress is per-attempt, not a diff against the last attempt ------------
+# Every attempt reopens `dest` for writing and therefore RESTARTS the transfer
+# at byte zero, so the only correct progress signal is "did THIS attempt write
+# anything". A server whose delivered prefix shrinks from one attempt to the
+# next (a rate drop, a slower mirror behind the same name, a throttle kicking
+# in) is still plainly moving bytes and must keep earning budget.
+function _start_shrinking_server(payload::Vector{UInt8}, prefixes::Vector{Int})
+    server = listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    conn_no = Threads.Atomic{Int}(0)
+    @async begin
+        try
+            while true
+                conn = accept(server)
+                i = Threads.atomic_add!(conn_no, 1) + 1
+                @async try
+                    _read_http_request(conn)
+                    write(conn, "HTTP/1.1 200 OK\r\n",
+                          "Content-Length: $(length(payload))\r\n",
+                          "ETag: \"shrink\"\r\nConnection: close\r\n\r\n")
+                    if i <= length(prefixes)
+                        write(conn, @view payload[1:prefixes[i]])
+                        flush(conn)
+                        sleep(20)            # ... then stall, so the attempt times out
+                    else
+                        write(conn, payload) # healthy: serve it all at once
+                        flush(conn)
+                    end
+                catch
+                finally
+                    close(conn)
+                end
+            end
+        catch
+        end
+    end
+    return server, port
+end
+
+@testset "http transport — a shrinking prefix is still progress" begin
+    payload = rand(UInt8, 64 * 1024)
+    # Attempt 1 delivers 60 KiB then stalls; attempt 2 delivers only 24 KiB then
+    # stalls. Both moved bytes, so both must earn budget; comparing attempt 2
+    # against attempt 1's leftover instead calls it a wedge and gives up.
+    server, port = _start_shrinking_server(payload, [60 * 1024, 24 * 1024])
+    dest = tempname()
+    try
+        withenv("EARTHSCIIO_HTTP_TIMEOUT" => "1",
+                "EARTHSCIIO_HTTP_RETRIES" => "1",
+                "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
+            EarthSciIO._reset_http_downloader!()
+            r = EarthSciIO.fetch!(EarthSciIO.HttpTransport(),
+                                  "http://127.0.0.1:$port/shrink.bin", dest)
+            @test r.status == :downloaded
+        end
+        @test read(dest) == payload
+    finally
+        close(server); rm(dest; force = true)
+        EarthSciIO._reset_http_downloader!()
+    end
+end
+
+@testset "http transport — the whole fetch is bounded by TIMEOUT_MAX" begin
+    # A source that trickles above the bytes/s floor forever is never aborted by
+    # libcurl and grows `dest` on every attempt, so it earns every extension and
+    # is then charged every retry with backoff. The whole call must be bounded by
+    # `max(EARTHSCIIO_HTTP_TIMEOUT_MAX, RETRIES * TIMEOUT)` -- here 8 s -- not
+    # just one attempt.
+    server = listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    @async try
+        while true
+            conn = accept(server)
+            @async try
+                _read_http_request(conn)
+                write(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n",
+                      "Connection: close\r\n\r\n")
+                for _ in 1:200
+                    write(conn, zeros(UInt8, 512)); flush(conn); sleep(0.25)
+                end
+            catch
+            finally
+                close(conn)
+            end
+        end
+    catch
+    end
+    dest = tempname()
+    try
+        t0 = time()
+        withenv("EARTHSCIIO_HTTP_TIMEOUT" => "1",
+                "EARTHSCIIO_HTTP_TIMEOUT_MAX" => "2",
+                "EARTHSCIIO_HTTP_RETRIES" => "8",
+                "EARTHSCIIO_HTTP_LOW_SPEED_TIME" => "60") do
+            EarthSciIO._reset_http_downloader!()
+            @test_throws Exception EarthSciIO.fetch!(
+                EarthSciIO.HttpTransport(), "http://127.0.0.1:$port/trickle.bin", dest)
+        end
+        # Budget is 8 s; without a whole-call deadline the extension ladder plus
+        # 8 backed-off retries runs for ~1 minute (measured: 57 s).
+        @test time() - t0 < 20
     finally
         close(server); rm(dest; force = true)
         EarthSciIO._reset_http_downloader!()

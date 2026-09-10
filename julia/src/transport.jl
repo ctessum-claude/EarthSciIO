@@ -87,7 +87,7 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
     lm === nothing || push!(headers, "If-Modified-Since" => lm)
 
     tries   = max(1, _http_env_int("EARTHSCIIO_HTTP_RETRIES", 5))
-    timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-request cap (s)
+    timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-ATTEMPT cap (s)
     tmax    = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX", 7200))
     base_timeout = timeout
     # `timeout` is a TOTAL per-request cap, so on its own it also caps the SIZE
@@ -102,19 +102,32 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
     # An attempt that timed out HAVING GROWN `dest` earns a bigger budget and is
     # not charged a retry; one that timed out at a standstill is the failure the
     # cap exists to bound, and it still dies in `timeout` seconds. The low-speed
-    # abort above (bytes/s floor, independently configurable) still catches the
-    # slow-trickle case that would otherwise extend forever.
+    # abort above (bytes/s floor, independently configurable) catches a trickle
+    # BELOW the floor -- but a trickle just ABOVE it is aborted by nothing, and
+    # grows `dest` on every attempt, so it earns every extension.
+    #
+    # The ladder must nonetheless compose into a BOUNDED wall time: `fetch!` is
+    # called once per zarr chunk object (zarr.jl), so an unbounded per-URL retry
+    # budget is the very hang this cap exists to prevent -- a source trickling
+    # just above the bytes/s floor is never aborted by libcurl and would walk the
+    # whole ladder (90+360+1440+5760+7200 s) and then still be charged its
+    # retries. One deadline for the whole call bounds that: `TIMEOUT_MAX` is the
+    # ceiling on the ENTIRE fetch, and each attempt is clamped to what is left.
+    # The floor of `tries * timeout` keeps the deadline from ever taking away
+    # retries the un-extended schedule would have had, so lowering `TIMEOUT_MAX`
+    # only shortens the extension ladder -- it never makes plain retries worse.
+    budget   = max(tmax, tries * timeout)
+    deadline = time() + budget
     extensions = 0
     local resp
     attempt = 0
     while attempt < tries
         attempt += 1
-        nbefore = isfile(dest) ? filesize(dest) : 0
         ok = false
         try
             resp = Downloads.request(url; method = "GET", output = dest,
                                      headers = headers, throw = false,
-                                     timeout = timeout,
+                                     timeout = min(timeout, max(deadline - time(), 0.001)),
                                      downloader = _http_downloader())
             # CRITICAL: with `throw=false`, a transport failure (stall abort, connect
             # timeout, or a Downloads-level `timeout` cancelling a lost-wakeup
@@ -133,8 +146,18 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
         # transfer outgrowing its budget, not a wedged one. Grow the cap and
         # refund the attempt (bounded, so a pathologically slow server still
         # terminates).
-        grew = (isfile(dest) ? filesize(dest) : 0) > nbefore
-        if grew && timeout < tmax && extensions < 6
+        #
+        # The progress signal is the bytes THIS attempt wrote, which is exactly
+        # `filesize(dest)`: every attempt reopens `dest` for writing and so
+        # truncates it (see the backoff comment below), and therefore restarts
+        # the transfer at byte zero. Comparing against the PREVIOUS attempt's
+        # leftover size instead would mis-read a healthy transfer whose rate
+        # merely dropped -- 3.6 GB in the first attempt then 1.8 GB in the
+        # (longer) second reads as "shrank", i.e. as a wedge -- and would
+        # reset the budget and burn the retries on a transfer that is plainly
+        # moving bytes.
+        grew = (isfile(dest) ? filesize(dest) : 0) > 0
+        if grew && timeout < tmax && extensions < 6 && time() < deadline
             timeout = min(timeout * 4, tmax)
             extensions += 1
             attempt -= 1
@@ -144,9 +167,10 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
         # budget, so hand the next attempt the ORIGINAL cap -- a wedge must never
         # inherit an extension earned by an earlier, healthy attempt.
         timeout = base_timeout
-        if attempt >= tries
+        if attempt >= tries || time() >= deadline
             resp isa Exception && throw(resp)
-            error("http transport: GET $url failed after $tries attempts: $resp")
+            error("http transport: GET $url failed after $attempt attempt(s) " *
+                  "(within a $(round(Int, budget)) s budget): $resp")
         end
         sleep(min(2.0^(attempt - 1), 10.0))   # partial `dest` truncated by next open
     end
