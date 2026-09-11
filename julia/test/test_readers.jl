@@ -20,6 +20,11 @@ end
 # are column-major, so reverse the dims before `vec`.
 _corder(a::AbstractVector) = collect(a)
 _corder(a::AbstractArray) = vec(permutedims(a, reverse(1:ndims(a))))
+# A 0-dimensional field — a netcdf SCALAR string, `char label(strlen)` on a
+# private dimension — has no axes to permute, and needs its own method:
+# `permutedims` with an EMPTY permutation throws on Julia 1.10 (CI's version)
+# while working on 1.12, so without this the suite passes locally and fails there.
+_corder(a::AbstractArray{<:Any,0}) = collect(vec(a))
 
 const READER_ATOL = 1e-6
 const READER_RTOL = 1e-9
@@ -346,6 +351,230 @@ end
     # a per-call select OVERRIDES the baked one
     @test size(materialize(pb; select = Dict("axes" => Any["all", "all", "all"]))["t2m"].data) ==
           size(full["t2m"].data)
+end
+
+import NCDatasets   # authors the NC_STRING fixture; also read directly below
+
+# --- NetCDF TEXT variables (spec/conformance.md §3) -------------------------
+#
+# A `char` array is not a native array of characters. Its LAST dimension is the
+# string length exactly when nothing else claims it as an axis (no coordinate
+# variable of its own, and every variable using it is a `char` using it last) —
+# xarray's `conventions.stackable`, which gates its `CharacterArrayCoder`. So the
+# same spelling means two different things depending on the rest of the FILE, and
+# NCDatasets hands back a raw `Char` array of the on-disk shape either way.
+#
+# The four blobs below are byte-for-byte the CDF-1 fixtures of
+# `rust/src/format/netcdf.rs` (`CHAR_VAR_CDF1`, `CHAR_HOLES_CDF1`,
+# `STRING_ROWS_CDF1`, `SCALAR_STRING_CDF1`), so the two tracks are held to the
+# same bytes here and not merely to the same prose. The expectations are xarray's
+# own output for those bytes (`xr.open_dataset(decode_times=False,
+# mask_and_scale=True)`), which spec/conformance.md §3 makes the reference.
+
+# dim `n=3`; `float value(n)` and `char label(n) = "abc"`. `n` is a REAL axis
+# (`value` lives on it), so `label` is three ONE-character strings.
+const CHAR_VAR_CDF1 = hex2bytes(
+    "43444601000000000000000a00000001" *
+    "000000016e0000000000000300000000" *
+    "000000000000000b0000000200000005" *
+    "76616c75650000000000000100000000" *
+    "0000000000000000000000050000000c" *
+    "0000007c000000056c6162656c000000" *
+    "00000001000000000000000000000000" *
+    "0000000200000004000000883f800000" *
+    "400000004040000061626300")
+
+# The same file with an interior NUL: `char label(n) = "a\0c"`. A NUL cell is the
+# EMPTY string (numpy's `|S1` of a NUL byte is `b""`), never `"\0"`.
+const CHAR_HOLES_CDF1 = hex2bytes(
+    "43444601000000000000000a00000001" *
+    "000000016e0000000000000300000000" *
+    "000000000000000b0000000200000005" *
+    "76616c75650000000000000100000000" *
+    "0000000000000000000000050000000c" *
+    "0000007c000000056c6162656c000000" *
+    "00000001000000000000000000000000" *
+    "0000000200000004000000883f800000" *
+    "400000004040000061006300")
+
+# dims `n=4` and a PRIVATE `strlen=4`; `float value(n)` and `char label(n,
+# strlen)` = "ab", "cd  ", "efgh", "". Nothing but `label` uses `strlen`, so
+# `strlen` is the string length: four strings on `dims == ["n"]`.
+const STRING_ROWS_CDF1 = hex2bytes(
+    "43444601000000000000000a00000002" *
+    "000000016e0000000000000400000006" *
+    "7374726c656e00000000000400000000" *
+    "000000000000000b0000000200000005" *
+    "76616c75650000000000000100000000" *
+    "00000000000000000000000500000010" *
+    "00000090000000056c6162656c000000" *
+    "00000002000000000000000100000000" *
+    "000000000000000200000010000000a0" *
+    "3f800000400000004040000040800000" *
+    "61620000636420206566676800000000")
+
+# dims `n=3` and a private `strlen=5`; `float value(n)` and a ONE-dimensional
+# `char label(strlen)` = "hi". Its only dimension is the length, so the field is
+# a SCALAR string: `dims == []`.
+const SCALAR_STRING_CDF1 = hex2bytes(
+    "43444601000000000000000a00000002" *
+    "000000016e0000000000000300000006" *
+    "7374726c656e00000000000500000000" *
+    "000000000000000b0000000200000005" *
+    "76616c75650000000000000100000000" *
+    "0000000000000000000000050000000c" *
+    "0000008c000000056c6162656c000000" *
+    "00000001000000010000000000000000" *
+    "0000000200000008000000983f800000" *
+    "40000000404000006869000000000000")
+
+# Run `f` over a temp file holding `bytes` (the corpus blobs are extension-less,
+# and so are these — the reader is handed a path, never a name to sniff).
+function _with_nc_blob(f, bytes)
+    mktempdir() do dir
+        path = joinpath(dir, "blob.nc")
+        write(path, bytes)
+        return f(path)
+    end
+end
+
+@testset "netcdf reader — text variables are `string` fields (spec §3)" begin
+    reader = FORMAT_REGISTRY["netcdf"]
+
+    # A `char label(n)` beside a `float value(n)`: `n` counts elements, so every
+    # cell is its own one-character string. xarray: `dims=('n',) shape=(3,) |S1`
+    # holding `[b'a', b'b', b'c']`.
+    _with_nc_blob(CHAR_VAR_CDF1) do path
+        nds = read_native(reader, path)
+        # Read-everything RETURNS the text variable: a track that skipped it hands
+        # back a different set of fields for the same bytes, which is a divergence.
+        @test variable_names(nds) == ["label", "value"]
+        f = nds["label"]
+        @test eltype(f.data) <: AbstractString
+        @test f.dims == ["n"]
+        @test size(f.data) == (3,)
+        @test f.data == ["a", "b", "c"]
+    end
+
+    # ...and a NUL cell in such a variable is the EMPTY string, never `"\0"`.
+    # xarray: `[b'a', b'', b'c']`.
+    _with_nc_blob(CHAR_HOLES_CDF1) do path
+        f = read_native(reader, path)["label"]
+        @test f.dims == ["n"]
+        @test f.data == ["a", "", "c"]
+    end
+
+    # A PRIVATE last dimension is the string length and is CONSUMED: four strings
+    # on `dims == ["n"]`, not a 4x4 `Char` matrix. Trailing NULs are stripped and
+    # trailing SPACES are data, so `"cd  "` survives whole and an all-NUL row is
+    # `""`. xarray: `dims=('n',) shape=(4,) |S4` = `[b'ab', b'cd  ', b'efgh', b'']`.
+    _with_nc_blob(STRING_ROWS_CDF1) do path
+        f = read_native(reader, path)["label"]
+        @test f.dims == ["n"]
+        @test size(f.data) == (4,)
+        @test f.data == ["ab", "cd  ", "efgh", ""]
+    end
+
+    # The 1-D case of the same rule: one string, and therefore a SCALAR field —
+    # `dims` and `size` both empty. xarray: `dims=() shape=() |S5` = `b'hi'`.
+    _with_nc_blob(SCALAR_STRING_CDF1) do path
+        f = read_native(reader, path)["label"]
+        @test f.dims == String[]
+        @test size(f.data) == ()
+        @test f.data[] == "hi"
+    end
+
+    # A NetCDF-4 `NC_STRING` is already one string per element: `dims`/`shape` are
+    # the variable's own, nothing is consumed. xarray: `dims=('n',) <U5`.
+    mktempdir() do dir
+        path = joinpath(dir, "nc4strings.nc")
+        NCDatasets.NCDataset(path, "c") do ds
+            NCDatasets.defDim(ds, "n", 3)
+            NCDatasets.defVar(ds, "label", String, ("n",))[:] = ["alpha", "be", "gamma"]
+            NCDatasets.defVar(ds, "value", Float64, ("n",))[:] = [1.0, 2.0, 3.0]
+        end
+        f = read_native(reader, path)["label"]
+        @test f.dims == ["n"]
+        @test f.data == ["alpha", "be", "gamma"]
+    end
+
+    # A text variable is PROJECTABLE by name like any other field, and a typo is
+    # an error listing what is present — never a silently missing array.
+    _with_nc_blob(STRING_ROWS_CDF1) do path
+        one = read_native(reader, path; variables = ["label"])
+        @test variable_names(one) == ["label"]
+        @test one["label"].data == ["ab", "cd  ", "efgh", ""]
+        @test_throws ArgumentError read_native(reader, path; variables = ["nope"])
+    end
+end
+
+@testset "netcdf reader — a string LENGTH is not an axis a `select` can bind to" begin
+    reader = FORMAT_REGISTRY["netcdf"]
+
+    # A selection is applied by dimension NAME to every array, text included: a
+    # `char label(n)` must lose the same cells `value(n)` loses.
+    _with_nc_blob(STRING_ROWS_CDF1) do path
+        full = read_native(reader, path)
+        w = read_native(reader, path; select = Dict("axes" => Any[Dict("indices" => [0, 2])]))
+        @test w["label"].dims == ["n"]
+        @test w["label"].data == ["ab", "efgh"]
+        @test w["value"].data == full["value"].data[[1, 3]]
+
+        # The positional rank match is over the DECODED field's dims, not the
+        # on-disk ones. `char label(n, strlen)` is a RANK-1 field on TWO on-disk
+        # dimensions, so a 2-axis select matches nothing here and says so. Counting
+        # on-disk dims instead would let `label` answer for rank 2, bind axis 1 to a
+        # string LENGTH, and then apply that selector BY NAME to every other array
+        # in the blob — here it would hand back "ab"/"cd"/"ef" and call it a window.
+        e = try
+            read_native(reader, path;
+                        select = Dict("axes" => Any["all", Dict("indices" => [0, 1])]))
+            nothing
+        catch err
+            err
+        end
+        @test e isa ArgumentError
+        @test occursin("no variable in the blob has rank 2", sprint(showerror, e))
+    end
+
+    # The same hazard's other face: here `value(n)` and `char label(strlen)` are
+    # both rank 1 ON DISK, but `label` decodes to a SCALAR. A single-axis select
+    # must bind `n` alone; binding `strlen` too would truncate "hi" to "h" — a
+    # wrong STRING, invisible to any shape assertion.
+    _with_nc_blob(SCALAR_STRING_CDF1) do path
+        full = read_native(reader, path)
+        w = read_native(reader, path; select = Dict("axes" => Any[Dict("indices" => [0, 2])]))
+        @test w["value"].data == full["value"].data[[1, 3]]
+        @test w["label"].dims == String[]
+        @test w["label"].data[] == "hi"
+    end
+
+    # The guard on that invariant. `_netcdf_dim_selection` can no longer produce a
+    # consumed dimension's name, so the refusal is exercised directly: naming a
+    # string length is an ERROR, not a no-op — honouring it would slice characters
+    # off every string, and ignoring it would hand back the full array while the
+    # caller believes they asked for a window.
+    _with_nc_blob(STRING_ROWS_CDF1) do path
+        NCDatasets.NCDataset(path, "r") do ds
+            v = ds["label"]
+            @test EarthSciIO._netcdf_consumed_dim(ds, v) == "strlen"
+            @test EarthSciIO._netcdf_field_dims(ds, v) == ["n"]
+            # ...while a variable whose last dimension is a real axis consumes none.
+            @test EarthSciIO._netcdf_consumed_dim(ds, ds["value"]) === nothing
+            data = EarthSciIO._netcdf_text_data(ds, v)
+            e = try
+                EarthSciIO._netcdf_text_select(ds, v, ["n"], data, Dict("strlen" => [0, 1]))
+                nothing
+            catch err
+                err
+            end
+            @test e isa ArgumentError
+            @test occursin("string LENGTH", sprint(showerror, e))
+            # a selector on a REAL axis of the field still applies, of course
+            @test EarthSciIO._netcdf_text_select(ds, v, ["n"], data,
+                                                 Dict("n" => [0, 2])) == ["ab", "efgh"]
+        end
+    end
 end
 
 @testset "reader edge cases" begin

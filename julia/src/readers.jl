@@ -83,6 +83,20 @@ NCDatasets exposes arrays in column-major (reversed) dimension order; this
 reader permutes each array back to **file order** so `field.dims` and
 `size(field.data)` match the on-disk layout (and the Python/xarray track).
 
+TEXT variables (`char` arrays, NetCDF-4 `NC_STRING`) are `string` fields like any
+other field — projectable, selectable, never skipped (spec/conformance.md §3).
+NCDatasets returns a `char` array as a raw `Char` array of the full on-disk
+shape, which is not what the bytes mean: the classic-NetCDF convention is that
+the last dimension is the STRING LENGTH exactly when nothing else claims it as an
+axis (it has no coordinate variable of its own and every variable using it is a
+`char` using it last). So `char label(n, strlen)` decodes to `n` strings on
+`dims == ["n"]`, a 1-D `char label(strlen)` on a private dimension to a SCALAR
+string (`dims == []`), while `char label(n)` beside a `float value(n)` stays `n`
+one-character strings. Trailing NUL padding is stripped and only trailing NULs —
+a trailing SPACE is data — and an all-NUL cell is the EMPTY string, never `"\0"`.
+This is exactly xarray's `CharacterArrayCoder`/`conventions.stackable` rule, so
+the three tracks return the same strings for the same bytes.
+
 `reader_kwargs`: `variables=[...]` restricts the returned **data variables** and
 is a real PROJECTION PUSHDOWN — an unrequested variable is never decoded, rather
 than decoded and thrown away. Coordinate fields are always returned (they are the
@@ -107,7 +121,10 @@ differently here. Applied thus:
 
   * the axes are **positional over FILE-order dims** (`[time, lev, lat, lon]` for
     a GEOS-FP A3dyn variable, i.e. the order `field.dims` reports) of every array
-    whose rank equals the axis count — the zarr rule;
+    whose rank equals the axis count — the zarr rule. Rank is the DECODED field's,
+    so a `char label(n, strlen)` counts as rank **1**: a consumed string length is
+    not an axis, no selector may bind to it, and a selection naming one is an
+    error rather than a silent truncation of every string;
   * that induces a **dimension-name → selector** map, which is then applied by
     NAME to every other array **and to the coordinate fields**, so a windowed
     variable can never come back beside a full-length `lon`/`lat`. Two arrays of
@@ -167,6 +184,138 @@ function _carry_attrs(attrib)
     return d
 end
 
+# --- text (`char` / `NC_STRING`) variables ----------------------------------
+#
+# spec/conformance.md §3, "NetCDF text variables are `string` fields in every
+# track". A `char` array is NOT a native array of characters: the classic-NetCDF
+# convention is that its LAST dimension is the string length, so `char label(n,
+# strlen)` is `n` NUL-padded strings, not `n × strlen` single characters. But the
+# very same spelling `char label(n)` next to a `float value(n)` is `n` one-byte
+# strings, because there `n` is a real axis a numeric variable lives on — the
+# dimension name alone cannot tell the two apart, and NCDatasets hands back the
+# raw `Char` array either way. These helpers apply the file-wide rule the Python
+# (xarray `conventions.stackable` → `CharacterArrayCoder`) and Rust tracks
+# already apply, so the same bytes decode to the same `String` field everywhere.
+
+# The variable's on-disk dimension names in FILE order (NCDatasets reports them
+# column-major, i.e. reversed).
+_netcdf_file_dims(v) = reverse(String.(collect(NCDatasets.dimnames(v))))
+
+# Does this variable decode to a `string` field? `.var` is the raw (non-CF)
+# variable, so a `_FillValue` attribute cannot widen the eltype to
+# `Union{Missing,Char}` and hide the answer.
+function _netcdf_is_text(v)::Bool
+    et = eltype(v.var)
+    return et === Char || et <: AbstractString
+end
+
+# Does `v`'s LAST dimension measure a STRING LENGTH rather than count elements?
+# This is a property of the whole FILE, not of the variable in isolation: the
+# last dimension is a length exactly when nothing else claims it as an axis —
+#
+#   * it has no coordinate variable of its own, and
+#   * every variable that uses it is a `char` variable that uses it LAST.
+#
+# That is xarray's `conventions.stackable`, which gates its `CharacterArrayCoder`
+# and therefore fixes what the Python track returns for these bytes. An
+# `NC_STRING` element is already a whole string, so it stacks nothing.
+function _netcdf_stacks_last_dim(ds, v)::Bool
+    eltype(v.var) === Char || return false
+    fdims = _netcdf_file_dims(v)
+    isempty(fdims) && return false          # a scalar `char` is one 1-byte string
+    last = fdims[end]
+    haskey(ds, last) && return false        # a coordinate variable ⇒ a real axis
+    for vn in keys(ds)
+        o = ds[vn]
+        od = _netcdf_file_dims(o)
+        last in od || continue
+        (eltype(o.var) === Char && od[end] == last) || return false
+    end
+    return true
+end
+
+# The string-length dimension `v` CONSUMES, or `nothing`. A consumed dimension is
+# not an axis of the decoded field, so it must never be counted in a `select`'s
+# positional rank match and must never be selectable.
+_netcdf_consumed_dim(ds, v) =
+    _netcdf_stacks_last_dim(ds, v) ? _netcdf_file_dims(v)[end] : nothing
+
+# The dims of the FIELD `v` decodes to: its on-disk dims minus a consumed string
+# length. EVERY part of this reader that reasons about a variable's axes must go
+# through here rather than through `dimnames` directly, because for a `char`
+# array the two disagree and the on-disk answer is the wrong one.
+function _netcdf_field_dims(ds, v)
+    fdims = _netcdf_file_dims(v)
+    _netcdf_stacks_last_dim(ds, v) && pop!(fdims)
+    return fdims
+end
+
+# One consumed run of `Char`s → a `String`, with TRAILING NUL padding stripped
+# and only trailing NULs: a trailing SPACE is data, and an interior NUL survives.
+# An all-NUL run is the EMPTY string, never `"\0"` — numpy's `|S` semantics, which
+# is what makes this agree with xarray byte for byte.
+function _netcdf_nul_stripped(chars::AbstractVector{Char})
+    n = length(chars)
+    while n > 0 && chars[n] == '\0'
+        n -= 1
+    end
+    return String(chars[1:n])
+end
+
+# Decode a text variable to a `String` array on the axes `_netcdf_field_dims`
+# reports, in file order. Three shapes, all of them what xarray returns:
+#
+#   * `NC_STRING` — already one string per element, dims/shape the variable's own;
+#   * `char` with a consumed last dimension — that dimension folds away, so
+#     `char label(n, strlen)` is `n` strings and a 1-D `char label(strlen)` on a
+#     private dimension is a SCALAR string (a 0-dimensional array, `dims == []`);
+#   * `char` whose last dimension is a real axis — one one-character string per
+#     cell, with a NUL cell the EMPTY string (numpy's `|S1` of a NUL byte is `b""`).
+function _netcdf_text_data(ds, v)
+    raw = _to_file_order(Array(v.var))
+    eltype(raw) <: AbstractString && return map(String, raw)
+    if _netcdf_stacks_last_dim(ds, v)
+        sz = size(raw)
+        strlen = sz[end]
+        outsz = sz[1:end-1]
+        out = Array{String}(undef, outsz)
+        for idx in CartesianIndices(outsz)
+            out[idx] = _netcdf_nul_stripped(Char[raw[Tuple(idx)..., k] for k in 1:strlen])
+        end
+        return out
+    end
+    return map(c -> c == '\0' ? "" : string(c), raw)
+end
+
+# Apply the decode-time selection to an already-decoded text field, over the axes
+# the FIELD has. A `select` is applied by dimension NAME to every array, so a
+# `char label(n)` beside a `float value(n)` must lose the same cells or the two
+# come back describing different rows. What differs from the numeric path:
+#
+#   * no hyperslab — the strings are decoded whole and gathered, because the
+#     NUL-stripping that makes this track agree with xarray happens per string,
+#     and a label array is never the gridded read the hyperslab exists for;
+#   * a CONSUMED string-length dimension is not selectable. Honouring such a
+#     selector would slice CHARACTERS off every string (`"efgh"` handed back as
+#     `"ef"` — a wrong string no shape assertion can see) and ignoring it would
+#     silently return the full array, so it is an ERROR. `_netcdf_dim_selection`
+#     cannot produce such a name (that is what `_netcdf_field_dims` is for); this
+#     is the guard on that invariant, matching the Rust track.
+function _netcdf_text_select(ds, v, dims::Vector{String}, data, sel)
+    sel === nothing && return data
+    cd = _netcdf_consumed_dim(ds, v)
+    if cd !== nothing && haskey(sel, cd)
+        throw(ArgumentError(
+            "select asks for a subset of '$cd', which is the string LENGTH of the " *
+            "char variable '$(NCDatasets.name(v))', not an axis of it; the decoded " *
+            "field has dims $dims, and selecting along a string length would " *
+            "truncate every string rather than choose cells"))
+    end
+    any(haskey(sel, d) for d in dims) || return data
+    idx = Any[haskey(sel, d) ? (sel[d] .+ 1) : Colon() for d in dims]
+    return data[idx...]
+end
+
 # The set of DATA variables a `variables` projection asks for, or `nothing` for
 # "all of them" (`variables === nothing` or an EMPTY list — spec/conformance.md
 # §3, which the parquet reader and both sibling tracks already spell this way).
@@ -199,6 +348,15 @@ end
 # array whose rank matches the axis count (the zarr rule); the induced map is what
 # the read applies BY NAME, which is what keeps the coordinates in step with the
 # data. netCDF dimension lengths are file-global, so each axis resolves once.
+#
+# "The arrays" means the FIELDS this blob decodes to, so the rank a variable
+# offers is `_netcdf_field_dims`'s, not `dimnames`'s. The two differ for exactly
+# one shape and it matters enormously: a `char label(n, strlen)` is a RANK-1 field
+# on two on-disk dimensions, so counting its dimensions would let a 2-axis
+# `select` "match" a variable nobody can index that way, bind axis 0 to `n` and
+# axis 1 to a string LENGTH, and then apply those selectors BY NAME to every other
+# array in the file — silently moving which dimension a selector means for the
+# numeric variables the caller was actually windowing.
 function _netcdf_dim_selection(ds, select)
     axes_spec = _select_axes(select)
     axes_spec === nothing && return nothing
@@ -208,7 +366,7 @@ function _netcdf_dim_selection(ds, select)
     bydim = Dict{String,Any}()
     matched = false
     for vn in keys(ds)
-        dims = reverse(String.(collect(NCDatasets.dimnames(ds[vn]))))
+        dims = _netcdf_field_dims(ds, ds[vn])
         length(dims) == naxes || continue
         matched = true
         for (i, d) in enumerate(dims)
@@ -316,12 +474,24 @@ function read_native(::NetCDFReader, path::AbstractString; variables = nothing,
             (want === nothing || name in dimset || name in want) || continue
             v = ds[vn]
             attrs = _carry_attrs(v.attrib)
-            file_dims = reverse(String.(collect(NCDatasets.dimnames(v))))
-            # A CF time axis is read RAW (no CF transform), so a "hours since …"
-            # axis stays the stored integers; everything else is mask_and_scale'd
-            # (NCDatasets applies scale/offset + _FillValue→missing).
-            data = _netcdf_read(v, file_dims, sel, _is_cf_time(v.attrib))
-            field = NativeField(data, file_dims, attrs)
+            field = if _netcdf_is_text(v)
+                # TEXT (spec/conformance.md §3): a `char` array or an `NC_STRING`
+                # is a `string` field, on the axes the DECODED field has — a
+                # consumed string-length dimension is not one of them. Never a
+                # raw `Char` matrix, which is what NCDatasets hands back and what
+                # made this track disagree with xarray and netcdf-rs.
+                fdims = _netcdf_field_dims(ds, v)
+                NativeField(_netcdf_text_select(ds, v, fdims,
+                                                _netcdf_text_data(ds, v), sel),
+                            fdims, attrs)
+            else
+                file_dims = _netcdf_file_dims(v)
+                # A CF time axis is read RAW (no CF transform), so a "hours since …"
+                # axis stays the stored integers; everything else is mask_and_scale'd
+                # (NCDatasets applies scale/offset + _FillValue→missing).
+                NativeField(_netcdf_read(v, file_dims, sel, _is_cf_time(v.attrib)),
+                            file_dims, attrs)
+            end
             if String(vn) in dimset
                 nds.coords[String(vn)] = field
             else

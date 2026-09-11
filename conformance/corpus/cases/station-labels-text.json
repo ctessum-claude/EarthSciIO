@@ -1,0 +1,87 @@
+{
+  "schema": "earthsciio/cache-case/v1",
+  "id": "station-labels-text",
+  "loader": "openaq",
+  "kind": "points",
+  "format": "netcdf",
+  "transport": "file",
+  "store": "local",
+  "resolved_url": "https://data.earthsci.dev/openaq/stations/monitor-metadata.nc",
+  "cache_key": "5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587",
+  "blob_path": "cache/v1/blobs/5d/5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587.nc",
+  "manifest_path": "cache/v1/meta/5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587.json",
+  "content_sha256": "1731d104cdeab584735169f415359b42e3eb9b95c40aa0499b541d54ab2c2436",
+  "bytes": 324,
+  "select": {
+    "all_records": true
+  },
+  "decode": {
+    "char_stacking": true,
+    "nul_stripped": true,
+    "fill_to_nan": false,
+    "time_decoded": false
+  },
+  "expected": {
+    "variables": {
+      "value": {
+        "dtype": "float64",
+        "dims": [
+          "site"
+        ],
+        "shape": [
+          4
+        ],
+        "fill_value": null,
+        "data": [
+          12.5,
+          13.0,
+          14.25,
+          15.75
+        ]
+      },
+      "site_id": {
+        "dtype": "string",
+        "dims": [
+          "site"
+        ],
+        "shape": [
+          4
+        ],
+        "fill_value": null,
+        "data": [
+          "ab",
+          "cd  ",
+          "efgh",
+          ""
+        ]
+      },
+      "flag": {
+        "dtype": "string",
+        "dims": [
+          "site"
+        ],
+        "shape": [
+          4
+        ],
+        "fill_value": null,
+        "data": [
+          "a",
+          "",
+          "c",
+          "d"
+        ]
+      },
+      "title": {
+        "dtype": "string",
+        "dims": [],
+        "shape": [],
+        "fill_value": null,
+        "data": [
+          "hi"
+        ]
+      }
+    },
+    "coords": {}
+  },
+  "notes": "NetCDF TEXT variables in all three of their readings, in ONE blob (spec/conformance.md \u00a73). `char site_id(site, strlen)` on a PRIVATE strlen is 4 STRINGS on dims [site] \u2014 the length dimension is consumed, trailing NULs are stripped, a trailing SPACE is data (\"cd  \") and an all-NUL row is \"\". `char flag(site)` shares `site` with `float64 value(site)`, so `site` is a real axis and every cell is its own ONE-character string, with the NUL cell the EMPTY string. `char title(titlelen)` alone on a private dimension is a SCALAR string (dims []). The rule is about the FILE, not the variable: the same spelling means different things here depending on what else uses the dimension."
+}

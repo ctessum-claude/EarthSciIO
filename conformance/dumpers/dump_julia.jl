@@ -63,15 +63,30 @@ _load_ext(:EarthSciIOTiffImagesExt, "TiffImages")
 # order — matches numpy `.reshape(-1)` on the Python track's arrays.
 _corder(a::AbstractVector) = collect(a)
 _corder(a::AbstractArray) = vec(permutedims(a, reverse(1:ndims(a))))
+# A 0-dimensional field — a netcdf SCALAR string, `char label(strlen)` on a
+# private dimension (spec/conformance.md §3) — has no axes to permute, and it
+# needs its own method: `permutedims` with an EMPTY permutation throws on Julia
+# 1.10 (`sum` of an empty tuple) while working on 1.12, so without this the dump
+# succeeds locally and dies in CI.
+_corder(a::AbstractArray{<:Any,0}) = collect(vec(a))
 
 # Encode one NativeField to the dump schema (dtype/dims/shape/data).
 function encode_field(field)
     data = field.data
     dims = collect(String.(field.dims))
     if eltype(data) <: AbstractString
-        vals = Any[String(x) for x in data]
+        # A string field is not necessarily the 1-D column the csv/ff10/parquet
+        # readers return: a netcdf TEXT variable (spec/conformance.md §3) can be a
+        # SCALAR string (a `char label(strlen)` on a private dimension, `dims ==
+        # []`) or multi-dimensional. So the shape is the array's own and the values
+        # are flattened row-major like every other field — `[length(vals)]` would
+        # report `[1]` for a scalar and the wrong axis order for a matrix, and
+        # `eltype Char` used to reach the numeric branch below and error outright,
+        # which is why no corpus case could carry a char variable before.
+        vals = Any[String(x) for x in _corder(data)]
         return _with_fill_value(Dict("dtype" => "string", "dims" => dims,
-                                     "shape" => [length(vals)], "data" => vals), field)
+                                     "shape" => collect(Int, size(data)),
+                                     "data" => vals), field)
     end
     flat = _corder(data)
     et = eltype(data)

@@ -281,6 +281,124 @@ def window_era5_expected(expected: dict) -> dict:
 
 
 # -----------------------------------------------------------------------------
+# Fixture 1c — NetCDF TEXT variables (transport=file, format=netcdf).
+#
+# A `char` array is not a native array of characters, and what it IS depends on
+# the rest of the file: its last dimension is the string LENGTH exactly when
+# nothing else claims it as an axis (spec/conformance.md §3, xarray's
+# `conventions.stackable` gating its `CharacterArrayCoder`). One blob carries all
+# three readings side by side, which is the only way to pin that the rule is
+# about the FILE and not about a variable in isolation:
+#
+#   * `char site_id(site, strlen)` on a PRIVATE `strlen` — 4 strings on
+#     dims ["site"], NUL padding stripped, a trailing SPACE kept as data, an
+#     all-NUL row the EMPTY string;
+#   * `char flag(site)` on the SAME axis `float64 value(site)` lives on — 4
+#     ONE-character strings, and its interior NUL cell is `""`, never `"\0"`;
+#   * `char title(titlelen)` alone on a private dimension — a SCALAR string
+#     (dims []), the 1-D case of the first rule.
+#
+# This is the case that could not be committed while one track returned a raw
+# `Char` matrix here and two of the three dumpers crashed on a string field.
+# -----------------------------------------------------------------------------
+SITE_IDS = ["ab", "cd  ", "efgh", ""]      # NUL-padded to strlen=4 on disk
+SITE_FLAGS = ["a", "", "c", "d"]           # the "" cell is a NUL byte on disk
+SITE_TITLE = "hi"                          # NUL-padded to titlelen=8 on disk
+SITE_VALUES = [12.5, 13.0, 14.25, 15.75]
+
+
+def _char_rows(strings, width):
+    """`strings` as an (n, width) `S1` array, NUL-padded — the on-disk layout."""
+    arr = np.zeros((len(strings), width), dtype="S1")
+    for i, s in enumerate(strings):
+        for j, ch in enumerate(s.encode("ascii")):
+            arr[i, j] = bytes([ch])
+    return arr
+
+
+def build_text_netcdf() -> tuple[bytes, dict, dict]:
+    from netCDF4 import Dataset  # lazy: only the netcdf fixtures need it
+
+    tmp = CORPUS / ".tmp_text.nc"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    ds = Dataset(tmp, "w", format="NETCDF3_CLASSIC")
+    ds.createDimension("site", len(SITE_IDS))
+    ds.createDimension("strlen", 4)
+    ds.createDimension("titlelen", 8)
+
+    # A numeric variable on `site` is what makes `site` a real AXIS rather than a
+    # string length — without it, `char flag(site)` would read as ONE string.
+    vval = ds.createVariable("value", "f8", ("site",))
+    vval.units = "ug m-3"
+    vval[:] = np.array(SITE_VALUES, dtype="f8")
+
+    vid = ds.createVariable("site_id", "S1", ("site", "strlen"))
+    vid[:] = _char_rows(SITE_IDS, 4)
+
+    vflag = ds.createVariable("flag", "S1", ("site",))
+    vflag[:] = _char_rows(SITE_FLAGS, 1)[:, 0]
+
+    vtitle = ds.createVariable("title", "S1", ("titlelen",))
+    vtitle[:] = _char_rows([SITE_TITLE], 8)[0]
+
+    ds.close()
+    data = tmp.read_bytes()
+    tmp.unlink()
+
+    expected = {
+        "variables": {
+            "value": {"dtype": "float64", "dims": ["site"], "shape": [4],
+                      "fill_value": None, "data": list(SITE_VALUES)},
+            # the private `strlen` is CONSUMED: 4 strings, not a 4x4 Char matrix
+            "site_id": {"dtype": "string", "dims": ["site"], "shape": [4],
+                        "fill_value": None, "data": list(SITE_IDS)},
+            # `site` is a real axis, so every cell is its own 1-character string
+            "flag": {"dtype": "string", "dims": ["site"], "shape": [4],
+                     "fill_value": None, "data": list(SITE_FLAGS)},
+            # a private length dimension ALONE => a scalar string: dims [], shape []
+            "title": {"dtype": "string", "dims": [], "shape": [],
+                      "fill_value": None, "data": [SITE_TITLE]},
+        },
+        # `site` carries no coordinate variable (and `strlen`/`titlelen` are not
+        # axes at all), so the file has no coordinate fields.
+        "coords": {},
+    }
+    decode = {
+        "char_stacking": True,      # the last dim is a length iff nothing claims it
+        "nul_stripped": True,       # trailing NULs go; trailing SPACES are data
+        "fill_to_nan": False,
+        "time_decoded": False,
+    }
+    return data, expected, decode
+
+
+# The window that pins the rank rule: ONE axis, so it binds `site` and only
+# `site`. Every rank-1 FIELD follows it — the numeric `value`, the 1-char `flag`
+# and the string `site_id`, which is rank 1 despite TWO on-disk dimensions —
+# while the scalar `title` is rank 0 and is untouched. A track that counted
+# on-disk dimensions would make `title` rank 1, bind this selector to `titlelen`,
+# and hand back `"h"` for it.
+TEXT_WINDOW = {"axes": [{"indices": [0, 2]}]}
+
+
+def window_text_expected(expected: dict) -> dict:
+    """Slice the full text expectation by TEXT_WINDOW — "the full read, sliced"."""
+    take = [0, 2]
+    out_vars = {}
+    for name, spec in expected["variables"].items():
+        if spec["dims"] == ["site"]:
+            data = [spec["data"][i] for i in take]
+            shape = [len(take)]
+        else:                       # the scalar string has no `site` axis
+            data = list(spec["data"])
+            shape = list(spec["shape"])
+        out_vars[name] = {"dtype": spec["dtype"], "dims": list(spec["dims"]),
+                          "shape": shape, "fill_value": spec["fill_value"],
+                          "data": data}
+    return {"variables": out_vars, "coords": {}}
+
+
+# -----------------------------------------------------------------------------
 # Fixture 2 — OpenAQ-like CSV points slice (transport=file, format=csv).
 #
 # Demonstrates a SECOND reader plugging into the FORMAT registry and yielding
@@ -1317,6 +1435,45 @@ def main() -> None:
                "inside the window, and that the time axis is untouched and raw. "
                "One blob, one sha256(url) key: a selection changes the decode, "
                "never the fetch."),
+    ))
+
+    text_data, text_expected, text_decode = build_text_netcdf()
+    summary.append(("station-labels-text",) + emit_case(
+        "station-labels-text",
+        loader="openaq", kind="points", fmt="netcdf", transport="file", store="local",
+        resolved_url="https://data.earthsci.dev/openaq/stations/monitor-metadata.nc",
+        ext="nc", data=text_data, expected=text_expected, decode=text_decode,
+        select={"all_records": True},
+        notes=("NetCDF TEXT variables in all three of their readings, in ONE blob "
+               "(spec/conformance.md §3). `char site_id(site, strlen)` on a "
+               "PRIVATE strlen is 4 STRINGS on dims [site] — the length dimension "
+               "is consumed, trailing NULs are stripped, a trailing SPACE is data "
+               "(\"cd  \") and an all-NUL row is \"\". `char flag(site)` shares "
+               "`site` with `float64 value(site)`, so `site` is a real axis and "
+               "every cell is its own ONE-character string, with the NUL cell the "
+               "EMPTY string. `char title(titlelen)` alone on a private dimension "
+               "is a SCALAR string (dims []). The rule is about the FILE, not the "
+               "variable: the same spelling means different things here depending "
+               "on what else uses the dimension."),
+    ))
+
+    summary.append(("station-labels-window",) + emit_case(
+        "station-labels-window",
+        loader="openaq", kind="points", fmt="netcdf", transport="file", store="local",
+        resolved_url="https://data.earthsci.dev/openaq/stations/monitor-metadata.nc",
+        ext="nc", data=text_data,
+        expected=window_text_expected(text_expected),
+        decode=dict(text_decode, decode_time_select=True),
+        select=TEXT_WINDOW,
+        notes=("The SAME blob and cache key as station-labels-text, read through a "
+               "ONE-axis decode-time `select` ({indices:[0,2]}). Pins that a text "
+               "field is windowed like any other — `site_id` and `flag` lose the "
+               "same cells `value` loses — and that the positional axis match is "
+               "over the DECODED field's dims: `site_id` is RANK 1 on TWO on-disk "
+               "dimensions, and the scalar `title` is RANK 0 and untouched. A "
+               "track that counted on-disk dimensions would bind this selector to "
+               "`titlelen` as well and hand back \"h\" for `title` — a wrong "
+               "STRING, invisible to every shape assertion."),
     ))
 
     csv_data, csv_expected, csv_decode = build_openaq_csv()

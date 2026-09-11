@@ -67,8 +67,24 @@ def _cmp_numeric(got: np.ndarray, expected_nested, label: str, errs: list):
         errs.append(f"{label}: value mismatch (max abs diff {d:g} > atol {ATOL:g})")
 
 
+def _as_text(v):
+    """One decoded cell as text.
+
+    A netcdf TEXT variable (``spec/conformance.md`` §3) comes back from xarray as
+    fixed-width BYTES (``|S4`` for a ``char`` array) — ``str(b'ab')`` is
+    ``"b'ab'"``, which would compare unequal to every expectation, so bytes are
+    decoded rather than repr'd.
+    """
+    return v.decode("utf-8") if isinstance(v, bytes) else str(v)
+
+
 def _cmp_string(got, expected_nested, label: str, errs: list):
-    g = [str(v) for v in _flat(got)]
+    # A reference reader may hand back a numpy array (netcdf) or a plain list of
+    # str (csv/ff10/shapefile); `_flat` only descends into lists, so flatten the
+    # array here — row-major, the corpus's own order.
+    if isinstance(got, np.ndarray):
+        got = got.reshape(-1).tolist()
+    g = [_as_text(v) for v in _flat(got)]
     e = [None if v is None else str(v) for v in _flat(expected_nested)]
     if g != e:
         errs.append(f"{label}: string mismatch {g} != {e}")

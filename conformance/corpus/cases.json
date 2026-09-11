@@ -16,6 +16,18 @@
       "blob_path": "cache/v1/blobs/11/11cdcec111409f586e6afc432e1a6da47e6f97ccf3715e5db8554632b00671c1.nc"
     },
     {
+      "id": "station-labels-text",
+      "file": "cases/station-labels-text.json",
+      "cache_key": "5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587",
+      "blob_path": "cache/v1/blobs/5d/5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587.nc"
+    },
+    {
+      "id": "station-labels-window",
+      "file": "cases/station-labels-window.json",
+      "cache_key": "5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587",
+      "blob_path": "cache/v1/blobs/5d/5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587.nc"
+    },
+    {
       "id": "openaq-points-slice",
       "file": "cases/openaq-points-slice.json",
       "cache_key": "69dd26b950e43cb2182e3b4d02e89e09bfb798b13469183ca2dad15c5794379a",
