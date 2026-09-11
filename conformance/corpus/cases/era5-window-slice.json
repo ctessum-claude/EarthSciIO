@@ -1,0 +1,140 @@
+{
+  "schema": "earthsciio/cache-case/v1",
+  "id": "era5-window-slice",
+  "loader": "era5",
+  "kind": "grid",
+  "format": "netcdf",
+  "transport": "file",
+  "store": "local",
+  "resolved_url": "https://data.earthsci.dev/era5/2018/11/20181108.nc",
+  "cache_key": "11cdcec111409f586e6afc432e1a6da47e6f97ccf3715e5db8554632b00671c1",
+  "blob_path": "cache/v1/blobs/11/11cdcec111409f586e6afc432e1a6da47e6f97ccf3715e5db8554632b00671c1.nc",
+  "manifest_path": "cache/v1/meta/11cdcec111409f586e6afc432e1a6da47e6f97ccf3715e5db8554632b00671c1.json",
+  "content_sha256": "fe1f8040ebd8688a4a16e80ef694a37ae2b1deb21b449eebfa90745cab95d3af",
+  "bytes": 1012,
+  "select": {
+    "axes": [
+      "all",
+      {
+        "slice": [
+          1,
+          3
+        ]
+      },
+      {
+        "indices": [
+          0,
+          2
+        ]
+      }
+    ]
+  },
+  "decode": {
+    "scale_factor_offset": true,
+    "fill_to_nan": true,
+    "time_decoded": false,
+    "decode_time_select": true
+  },
+  "expected": {
+    "variables": {
+      "t2m": {
+        "dtype": "float64",
+        "dims": [
+          "time",
+          "latitude",
+          "longitude"
+        ],
+        "shape": [
+          2,
+          2,
+          2
+        ],
+        "fill_value": null,
+        "data": [
+          [
+            [
+              283.25,
+              283.75
+            ],
+            [
+              284.0,
+              284.5
+            ]
+          ],
+          [
+            [
+              283.35,
+              283.85
+            ],
+            [
+              284.1,
+              null
+            ]
+          ]
+        ]
+      },
+      "sp": {
+        "dtype": "float64",
+        "dims": [
+          "time",
+          "latitude",
+          "longitude"
+        ],
+        "shape": [
+          2,
+          2,
+          2
+        ],
+        "fill_value": null,
+        "data": [
+          [
+            [
+              100300.0,
+              100500.0
+            ],
+            [
+              100600.0,
+              100800.0
+            ]
+          ],
+          [
+            [
+              100350.0,
+              100550.0
+            ],
+            [
+              100650.0,
+              100850.0
+            ]
+          ]
+        ]
+      }
+    },
+    "coords": {
+      "latitude": {
+        "dtype": "float64",
+        "data": [
+          39.5,
+          39.0
+        ]
+      },
+      "longitude": {
+        "dtype": "float64",
+        "data": [
+          -122.0,
+          -121.0
+        ]
+      },
+      "time": {
+        "dtype": "int32",
+        "units": "hours since 2018-11-08 00:00:00",
+        "calendar": "gregorian",
+        "data": [
+          0,
+          1
+        ]
+      }
+    }
+  },
+  "notes": "The SAME blob and cache key as era5-grid-sub-tile, read through a decode-time orthogonal `select`: lat {slice:[1,3]}, lon {indices:[0,2]}, time \"all\". Pins that a whole-file reader materialises only the hyperslab and returns arrays identical to the full read sliced afterwards, that the lat/lon COORDINATES are sliced with the data (a windowed variable beside a full-length axis is the trap), that the masked cell still decodes to NaN inside the window, and that the time axis is untouched and raw. One blob, one sha256(url) key: a selection changes the decode, never the fetch."
+}

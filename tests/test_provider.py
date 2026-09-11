@@ -105,6 +105,37 @@ def test_const_provider_materializes_oracle_arrays(cache):
 
 
 @pytest.mark.needs_format("netcdf")
+def test_netcdf_per_call_select_overrides_the_baked_one(cache):
+    """The whole-file netcdf reader honours a `select` at decode time, and the
+    per-call value OVERRIDES a baked ``reader_kwargs["select"]`` — the same
+    precedence the store-backed zarr reader has (``tests/test_zarr_reader.py``).
+    Neither changes the URL or the cache key: the same blob is read either way.
+    """
+    baked = {"axes": ["all", {"slice": [1, 3]}, {"indices": [0, 2]}]}
+    p = Provider(
+        DataSource("era5", "netcdf", ERA5_URL, reader_kwargs={"select": baked}), cache
+    )
+    assert p.supports_selection is True
+    assert p.store_backed is False
+
+    # the baked selection is honoured with no per-call argument at all
+    assert p.materialize()["t2m"].shape == (2, 2, 2)
+
+    # a per-call select wins over the baked one for this call only...
+    peek = p.materialize(select={"axes": ["all", {"indices": [0]}, "all"]})
+    assert peek["t2m"].shape == (2, 1, 3)
+    assert peek["latitude"].shape == (1,)
+    # ...and it is a peek: the baked projection is what the next plain read gives
+    assert p.materialize()["t2m"].shape == (2, 2, 2)
+
+    # a per-call select on a provider with NO baked one is still honoured
+    q = Provider(DataSource("era5", "netcdf", ERA5_URL), cache)
+    assert q.materialize()["t2m"].shape == (2, 3, 3)
+    assert q.materialize(select=baked)["t2m"].shape == (2, 2, 2)
+    assert q.materialize()["t2m"].shape == (2, 3, 3)
+
+
+@pytest.mark.needs_format("netcdf")
 def test_const_refresh_returns_constant_data(cache):
     p = Provider(DataSource("era5", "netcdf", ERA5_URL), cache)
     a = p.refresh(_utc(0))  # CONST: refresh is the constant data (materialize once)

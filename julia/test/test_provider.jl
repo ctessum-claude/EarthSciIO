@@ -237,7 +237,7 @@
         @test :member_glob in reader_option_keys(FF10Reader())
         @test :skip_header_row in reader_option_keys(FF10Reader())
         @test Set(reader_option_keys(ZarrReader())) == Set([:variables, :select])
-        @test reader_option_keys(NetCDFReader()) == [:variables]
+        @test Set(reader_option_keys(NetCDFReader())) == Set([:variables, :select])
 
         # ...and an option outside that set fails the Provider, naming it.
         e = try

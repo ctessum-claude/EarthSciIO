@@ -272,15 +272,23 @@ pub enum AxisSelect {
 
 impl AxisSelect {
     /// Resolve this selector to its ordered list of global indices over a
-    /// dimension of length `dim_len`.
+    /// dimension of length `dim_len`, reporting errors as the `zarr` format's.
     pub fn resolve(&self, dim_len: usize) -> Result<Vec<usize>> {
+        self.resolve_in(dim_len, "zarr")
+    }
+
+    /// [`resolve`](AxisSelect::resolve), tagging its errors with the reader that
+    /// asked. The selector vocabulary is shared by every reader that can honour a
+    /// `select` — the store-backed `zarr` one and the whole-file `netcdf` one —
+    /// so an out-of-range index must not report the wrong format's name.
+    pub fn resolve_in(&self, dim_len: usize, format: &str) -> Result<Vec<usize>> {
         match self {
             AxisSelect::All => Ok((0..dim_len).collect()),
             AxisSelect::Indices(v) => {
                 for &g in v {
                     if g >= dim_len {
                         return Err(crate::Error::Format {
-                            format: "zarr".to_string(),
+                            format: format.to_string(),
                             detail: format!("index {g} out of range for dimension length {dim_len}"),
                         });
                     }
@@ -290,11 +298,30 @@ impl AxisSelect {
             AxisSelect::Range { start, stop, step } => {
                 if *step < 1 {
                     return Err(crate::Error::Format {
-                        format: "zarr".to_string(),
+                        format: format.to_string(),
                         detail: format!("slice step must be >= 1, got {step}"),
                     });
                 }
-                Ok((*start..*stop).step_by(*step).collect())
+                let out: Vec<usize> = (*start..*stop).step_by(*step).collect();
+                // A range is bounds-checked exactly like an explicit index list:
+                // a `[start, stop)` reaching past the dimension is an ERROR, never
+                // a silent clamp. The three tracks cannot agree on a clamp (numpy
+                // clamps; NCDatasets and the `netcdf-reader` slice API do not), and
+                // an over-long window that quietly returns fewer cells than asked
+                // for is a wrong number. (`usize` already rules out a negative
+                // start, which is where Python's clamp becomes a wrap-around.)
+                if let Some(&g) = out.last() {
+                    if g >= dim_len {
+                        return Err(crate::Error::Format {
+                            format: format.to_string(),
+                            detail: format!(
+                                "slice [{start}, {stop}) by {step} reaches index {g}, out of \
+                                 range for dimension length {dim_len}"
+                            ),
+                        });
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -335,11 +362,20 @@ pub trait Reader: Send + Sync {
     }
 
     /// Whether this reader can honour a per-axis orthogonal [`Selection`] at read
-    /// time — **projection pushdown**, fetching only the intersecting chunk
-    /// objects. Default `false`; a store-backed reader that supports it (the
-    /// [`ZarrReader`]) overrides to `true`. The [`crate::Provider`] surfaces this so
-    /// a caller can decide whether to push a projection down or read whole and
-    /// slice itself. Mirrors the Julia/Python `supports_selection` trait.
+    /// time **without materialising the whole array** — projection pushdown. The
+    /// [`crate::Provider`] surfaces this so a caller can decide whether to push a
+    /// projection down or read whole and slice itself. Mirrors the Julia/Python
+    /// `supports_selection` trait. Default `false`.
+    ///
+    /// It says nothing about what is FETCHED; pair it with
+    /// [`store_backed`](Reader::store_backed) for that, because the two cases are
+    /// genuinely different:
+    ///
+    /// * store-backed + `supports_selection` ([`ZarrReader`]): the selection
+    ///   decides which chunk OBJECTS are downloaded, so it shrinks the transfer;
+    /// * whole-file + `supports_selection` (the `netcdf` reader): the same blob is
+    ///   fetched under the same cache key and only the requested hyperslab is
+    ///   materialised, so it shrinks the decode and the resident arrays.
     fn supports_selection(&self) -> bool {
         false
     }

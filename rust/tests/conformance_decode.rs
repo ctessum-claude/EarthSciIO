@@ -192,8 +192,17 @@ fn decodes_every_corpus_case_to_match_expected() {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
                 .unwrap_or_default();
+            // A whole-file reader that honours a `select` (netcdf) gets the
+            // case's orthogonal selection too: same blob, same cache key, only
+            // the requested hyperslab materialised. `parse_selection` yields
+            // `Selection::All` for a case that pins no `axes`.
+            let sel = if reader.supports_selection() {
+                parse_selection(&case)
+            } else {
+                Selection::All
+            };
             reader
-                .read_native(&blob.path, &vars, &Selection::All)
+                .read_native(&blob.path, &vars, &sel)
                 .unwrap_or_else(|e| panic!("decode failed for {id}: {e}"))
         };
 
@@ -463,4 +472,221 @@ fn netcdf_projection_rejects_an_absent_variable_and_keeps_coords() {
     let msg = err.to_string();
     assert!(msg.contains("nope"), "error must name the absent variable: {msg}");
     assert!(msg.contains("sp"), "error must list what IS present: {msg}");
+}
+
+/// The whole-file `netcdf` reader honours an orthogonal `Selection` at DECODE
+/// time: one blob, one cache key, only the requested hyperslab materialised.
+///
+/// The gate is that a windowed read equals the FULL read sliced afterwards, cell
+/// for cell — anything else is an off-by-one — and that the COORDINATES come back
+/// windowed with it, which is the trap a whole-file reader has that the
+/// store-backed zarr reader (no coords at all) never had.
+#[test]
+fn netcdf_select_windows_the_decode_and_slices_the_coords() {
+    let corpus = corpus_dir();
+    let case: Value =
+        serde_json::from_slice(&fs::read(corpus.join("cases/era5-grid-sub-tile.json")).unwrap())
+            .unwrap();
+    let blob = corpus.join(case["blob_path"].as_str().unwrap());
+    let reader = FormatRegistry::with_builtins().get("netcdf").unwrap();
+    assert!(reader.supports_selection());
+    assert!(!reader.store_backed(), "the fetch is unchanged; only the decode shrinks");
+
+    let full = reader.read_native(&blob, &[], &Selection::All).unwrap();
+    let full_t2m = to_opt_f64(&full.variables["t2m"].data);
+
+    // time all, latitude [1,3), longitude {0,2}
+    let sel = Selection::Orthogonal(vec![
+        AxisSelect::All,
+        AxisSelect::Range { start: 1, stop: 3, step: 1 },
+        AxisSelect::Indices(vec![0, 2]),
+    ]);
+    let w = reader.read_native(&blob, &[], &sel).unwrap();
+    let t2m = &w.variables["t2m"];
+    assert_eq!(t2m.shape, vec![2, 2, 2]);
+    assert_eq!(t2m.dims, vec!["time", "latitude", "longitude"]);
+
+    // full[t, 1..3, {0,2}] gathered by hand out of the [2,3,3] row-major array.
+    let mut expected: Vec<Option<f64>> = Vec::new();
+    for t in 0..2 {
+        for y in 1..3 {
+            for &x in &[0usize, 2usize] {
+                expected.push(full_t2m[t * 9 + y * 3 + x]);
+            }
+        }
+    }
+    assert_eq!(to_opt_f64(&t2m.data), expected);
+
+    // Coordinates are windowed WITH the data; the time axis is untouched and
+    // keeps its raw values plus units/calendar.
+    let full_lat = to_opt_f64(&full.coords["latitude"].field.data);
+    let full_lon = to_opt_f64(&full.coords["longitude"].field.data);
+    assert_eq!(
+        to_opt_f64(&w.coords["latitude"].field.data),
+        vec![full_lat[1], full_lat[2]]
+    );
+    assert_eq!(
+        to_opt_f64(&w.coords["longitude"].field.data),
+        vec![full_lon[0], full_lon[2]]
+    );
+    assert_eq!(
+        to_opt_f64(&w.coords["time"].field.data),
+        to_opt_f64(&full.coords["time"].field.data)
+    );
+    assert_eq!(w.coords["time"].calendar.as_deref(), Some("gregorian"));
+
+    // An explicit index list comes back in the ORDER GIVEN (the zarr rule): this
+    // is the path that reads a bounding slab and gathers out of it.
+    let permuted = Selection::Orthogonal(vec![
+        AxisSelect::All,
+        AxisSelect::All,
+        AxisSelect::Indices(vec![2, 0]),
+    ]);
+    let p = reader.read_native(&blob, &[], &permuted).unwrap();
+    assert_eq!(
+        to_opt_f64(&p.coords["longitude"].field.data),
+        vec![full_lon[2], full_lon[0]]
+    );
+    let pt = to_opt_f64(&p.variables["t2m"].data);
+    for t in 0..2 {
+        for y in 0..3 {
+            assert_eq!(pt[(t * 3 + y) * 2], full_t2m[t * 9 + y * 3 + 2]);
+            assert_eq!(pt[(t * 3 + y) * 2 + 1], full_t2m[t * 9 + y * 3]);
+        }
+    }
+}
+
+/// Time is the Provider's axis (it owns the cadence), and an axis count that
+/// matches no array is a mistake — both are refused, not quietly honoured.
+#[test]
+fn netcdf_select_refuses_a_time_subset_and_a_rank_mismatch() {
+    let corpus = corpus_dir();
+    let case: Value =
+        serde_json::from_slice(&fs::read(corpus.join("cases/era5-grid-sub-tile.json")).unwrap())
+            .unwrap();
+    let blob = corpus.join(case["blob_path"].as_str().unwrap());
+    let reader = FormatRegistry::with_builtins().get("netcdf").unwrap();
+
+    let time_sub = Selection::Orthogonal(vec![
+        AxisSelect::Indices(vec![0]),
+        AxisSelect::All,
+        AxisSelect::All,
+    ]);
+    let err = reader.read_native(&blob, &[], &time_sub).unwrap_err().to_string();
+    assert!(err.contains("time"), "{err}");
+
+    let wrong_rank = Selection::Orthogonal(vec![AxisSelect::All, AxisSelect::All]);
+    let err = reader
+        .read_native(&blob, &[], &wrong_rank)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("rank"), "{err}");
+}
+
+/// The edges of the shared selection vocabulary, as the netcdf reader must
+/// implement them — every one of these is a place the three tracks could
+/// silently disagree, so each is pinned identically in the Julia and Python
+/// suites (`julia/test/test_readers.jl`, `tests/test_readers.py`).
+#[test]
+fn netcdf_select_edges_match_the_shared_vocabulary() {
+    let corpus = corpus_dir();
+    let case: Value =
+        serde_json::from_slice(&fs::read(corpus.join("cases/era5-grid-sub-tile.json")).unwrap())
+            .unwrap();
+    let blob = corpus.join(case["blob_path"].as_str().unwrap());
+    let reader = FormatRegistry::with_builtins().get("netcdf").unwrap();
+    let full = reader.read_native(&blob, &[], &Selection::All).unwrap();
+    let full_t2m = to_opt_f64(&full.variables["t2m"].data);
+
+    // A FULL-EXTENT selection is the no-selection read, exactly. Both spellings
+    // of "everything" still go down the windowed path, so this is the read that
+    // catches an off-by-one in the slab planner.
+    for axes in [
+        vec![
+            AxisSelect::All,
+            AxisSelect::Range { start: 0, stop: 3, step: 1 },
+            AxisSelect::Range { start: 0, stop: 3, step: 1 },
+        ],
+        vec![
+            AxisSelect::All,
+            AxisSelect::Indices(vec![0, 1, 2]),
+            AxisSelect::Indices(vec![0, 1, 2]),
+        ],
+    ] {
+        let got = reader
+            .read_native(&blob, &[], &Selection::Orthogonal(axes))
+            .unwrap();
+        assert_eq!(got.variables["t2m"].shape, full.variables["t2m"].shape);
+        assert_eq!(to_opt_f64(&got.variables["t2m"].data), full_t2m);
+        for c in ["latitude", "longitude", "time"] {
+            assert_eq!(
+                to_opt_f64(&got.coords[c].field.data),
+                to_opt_f64(&full.coords[c].field.data)
+            );
+        }
+    }
+
+    // This vocabulary NEVER drops a dimension: a one-index axis comes back at
+    // length 1, not squeezed away (a track that squeezed would diverge in rank).
+    for axis in [
+        AxisSelect::Indices(vec![1]),
+        AxisSelect::Range { start: 1, stop: 2, step: 1 },
+    ] {
+        let got = reader
+            .read_native(
+                &blob,
+                &[],
+                &Selection::Orthogonal(vec![AxisSelect::All, axis, AxisSelect::All]),
+            )
+            .unwrap();
+        assert_eq!(got.variables["t2m"].shape, vec![2, 1, 3]);
+        assert_eq!(got.variables["t2m"].dims, vec!["time", "latitude", "longitude"]);
+        assert_eq!(got.coords["latitude"].field.shape, vec![1]);
+    }
+
+    // An axis may legally resolve to NOTHING: a zero-length axis, KEPT in `dims`,
+    // with `data` that actually IS empty. The bounding-slab planner would happily
+    // return a non-empty buffer beside a shape declaring 0 — a field whose shape
+    // contradicts its own data.
+    for axis in [
+        AxisSelect::Indices(vec![]),
+        AxisSelect::Range { start: 1, stop: 1, step: 1 },
+        AxisSelect::Range { start: 2, stop: 0, step: 1 },
+    ] {
+        let got = reader
+            .read_native(
+                &blob,
+                &[],
+                &Selection::Orthogonal(vec![AxisSelect::All, axis, AxisSelect::All]),
+            )
+            .unwrap();
+        for v in ["t2m", "sp"] {
+            assert_eq!(got.variables[v].shape, vec![2, 0, 3]);
+            assert_eq!(got.variables[v].dims, vec!["time", "latitude", "longitude"]);
+            assert!(to_opt_f64(&got.variables[v].data).is_empty());
+        }
+        assert_eq!(got.coords["latitude"].field.shape, vec![0]);
+        assert!(to_opt_f64(&got.coords["latitude"].field.data).is_empty());
+        // ...and the axes NOT selected keep their full length.
+        assert_eq!(got.coords["longitude"].field.shape, vec![3]);
+        assert_eq!(got.coords["time"].field.shape, vec![2]);
+    }
+
+    // A range is bounds-checked like an index list: an over-long window is an
+    // error, never a silent clamp (which would have shipped `shape = [2, 98, 3]`
+    // beside 12 values).
+    for axis in [
+        AxisSelect::Range { start: 1, stop: 99, step: 1 },
+        AxisSelect::Indices(vec![5]),
+    ] {
+        let err = reader
+            .read_native(
+                &blob,
+                &[],
+                &Selection::Orthogonal(vec![AxisSelect::All, axis, AxisSelect::All]),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "{err}");
+    }
 }

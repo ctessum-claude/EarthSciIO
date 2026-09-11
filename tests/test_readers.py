@@ -148,6 +148,168 @@ def test_netcdf_absent_variable_raises(offline_cache):
 
 
 # --------------------------------------------------------------------------- #
+# NetCDF decode-time `select`: one blob, one cache key, only the requested
+# hyperslab materialised (spec/conformance.md "NetCDF decode notes").
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_windows_the_decode_and_slices_coords(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+
+    sel = {"axes": ["all", {"slice": [1, 3]}, {"indices": [0, 2]}]}
+    w = reader.read_native(reader.open(blob.path), None, sel)
+
+    # The gate: a windowed read equals the FULL read sliced afterwards.
+    for name in ("t2m", "sp"):
+        expected = full[name].data[:, 1:3][:, :, [0, 2]]
+        assert np.array_equal(w[name].data, expected, equal_nan=True)
+        assert list(w[name].dims) == list(full[name].dims)  # dims are NAMES
+        assert w[name].attrs == full[name].attrs
+
+    # Coordinates are sliced WITH the data — a windowed variable beside a
+    # full-length lon/lat would be a silent trap.
+    assert np.array_equal(w["latitude"].data, full["latitude"].data[1:3])
+    assert np.array_equal(w["longitude"].data, full["longitude"].data[[0, 2]])
+    # the time axis is untouched, and still raw with its units/calendar
+    assert np.array_equal(w["time"].data, full["time"].data)
+    assert w["time"].attrs == full["time"].attrs
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_preserves_the_requested_index_order(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+    p = reader.read_native(reader.open(blob.path), None,
+                           {"axes": ["all", "all", {"indices": [2, 0]}]})
+    assert np.array_equal(p["t2m"].data, full["t2m"].data[:, :, [2, 0]], equal_nan=True)
+    assert np.array_equal(p["longitude"].data, full["longitude"].data[[2, 0]])
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_composes_with_variables(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+    both = reader.read_native(reader.open(blob.path), ["t2m"],
+                              {"axes": ["all", {"slice": [1, 3]}, "all"]})
+    assert both.variable_names() == ["t2m"]
+    assert np.array_equal(both["t2m"].data, full["t2m"].data[:, 1:3], equal_nan=True)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_refuses_a_time_subset(offline_cache):
+    """Record selection is the Provider's — it owns the cadence, not the reader."""
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    with pytest.raises(ValueError, match="time"):
+        reader.read_native(reader.open(blob.path), None,
+                           {"axes": [{"indices": [0]}, "all", "all"]})
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_refuses_an_axis_count_matching_nothing(offline_cache):
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    with pytest.raises(ValueError, match="rank"):
+        reader.read_native(reader.open(blob.path), None, {"axes": ["all", "all"]})
+
+
+def test_cf_time_units_detection_is_case_insensitive_and_token_wise():
+    """"hours SINCE 1900-01-01" must not be a time axis in one track and a
+    selectable spatial axis in another: the rule is a whitespace-separated
+    ``since`` token, case-insensitive, matching the Rust track exactly."""
+    from earthsciio.readers import _is_cf_time
+
+    for units in ("hours since 1900-01-01", "hours SINCE 1900-01-01",
+                  "days since 2018-11-08 00:00:00", "since"):
+        assert _is_cf_time({"units": units}) is True, units
+    for units in ("degrees_north", "Pa", "kg m-2 s-1", "sincerity", ""):
+        assert _is_cf_time({"units": units}) is False, units
+    assert _is_cf_time({}) is False
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_full_extent_select_is_identical_to_no_select(offline_cache):
+    """A selection covering every index must be the no-selection read, exactly.
+
+    Both spellings of "everything" — an explicit half-open slice and an explicit
+    index list — go down the windowed code path, so this is the read that catches
+    an off-by-one in the slab planner on the happy axis.
+    """
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+    for axes in (["all", {"slice": [0, 3]}, {"slice": [0, 3]}],
+                 ["all", {"indices": [0, 1, 2]}, {"indices": [0, 1, 2]}]):
+        got = reader.read_native(reader.open(blob.path), None, {"axes": axes})
+        for name in ("t2m", "sp"):
+            assert got[name].shape == full[name].shape
+            assert np.array_equal(got[name].data, full[name].data, equal_nan=True)
+        for name in ("latitude", "longitude", "time"):
+            assert np.array_equal(got[name].data, full[name].data)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_keeps_a_single_element_dimension(offline_cache):
+    """This vocabulary NEVER drops a dimension: a one-index axis comes back with
+    length 1, not squeezed away. A track that squeezed would diverge in rank."""
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    full = reader.read_native(reader.open(blob.path))
+    for axis in ({"indices": [1]}, {"slice": [1, 2]}):
+        got = reader.read_native(reader.open(blob.path), None,
+                                 {"axes": ["all", axis, "all"]})
+        assert got["t2m"].shape == (2, 1, 3)
+        assert list(got["t2m"].dims) == ["time", "latitude", "longitude"]
+        assert got["latitude"].shape == (1,)
+        assert np.array_equal(got["t2m"].data, full["t2m"].data[:, 1:2], equal_nan=True)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_empty_axis_is_a_zero_length_window(offline_cache):
+    """An axis may legally resolve to NOTHING — a length-0 axis, KEPT in dims.
+
+    The trap is a field whose ``shape`` contradicts its own ``dims`` and the
+    coordinates beside it: xarray's lazy indexer materialises an empty selection
+    to (1, 0, 1) rather than (2, 0, 3), and shipping that is silent corruption.
+    """
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    for axis in ({"indices": []}, {"slice": [1, 1]}, {"slice": [2, 0]}):
+        got = reader.read_native(reader.open(blob.path), None,
+                                 {"axes": ["all", axis, "all"]})
+        for name in ("t2m", "sp"):
+            assert got[name].shape == (2, 0, 3), axis
+            assert list(got[name].dims) == ["time", "latitude", "longitude"]
+            assert np.asarray(got[name].data).size == 0
+        assert got["latitude"].shape == (0,)
+        # ...and the axes NOT selected keep their full length.
+        assert got["longitude"].shape == (3,)
+        assert got["time"].shape == (2,)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_select_refuses_an_out_of_range_slice(offline_cache):
+    """A slice is bounds-checked like an `indices` list: an over-long window is an
+    error, never a silent clamp, and a negative bound never wraps around."""
+    blob = offline_cache.fetch(ERA5_URL)
+    reader = NetCDFReader()
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_native(reader.open(blob.path), None,
+                           {"axes": ["all", {"slice": [1, 99]}, "all"]})
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_native(reader.open(blob.path), None,
+                           {"axes": ["all", {"slice": [-2, 3]}, "all"]})
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_native(reader.open(blob.path), None,
+                           {"axes": ["all", {"indices": [5]}, "all"]})
+
+
+# --------------------------------------------------------------------------- #
 # CSV decode (numeric_columns -> float64, others -> string) — the 2nd format.
 # --------------------------------------------------------------------------- #
 

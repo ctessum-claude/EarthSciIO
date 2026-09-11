@@ -233,12 +233,23 @@ fn supports_selection_and_array_shape_capability_surface() {
     assert!(zprovider.supports_selection());
     assert_eq!(zprovider.array_shape("sr").unwrap(), Some(vec![3, 50, 4]));
 
-    // whole-file (netcdf) reader: no pushdown; shape unknown without a read.
+    assert!(zprovider.store_backed());
+
+    // whole-file (netcdf) reader: it DOES honour a select, at decode time, but it
+    // is not store-backed — that pair is how a caller tells "the download shrank"
+    // from "only the decode did". Shape is still unknown without a read.
     let nloader =
         DataSource::new("era5", "netcdf", "https://data.earthsci.dev/era5/2018/11/20181108.nc");
-    let nprovider = Provider::new(nloader, cache, None).unwrap();
-    assert!(!nprovider.supports_selection());
+    let nprovider = Provider::new(nloader, cache.clone(), None).unwrap();
+    assert!(nprovider.supports_selection());
+    assert!(!nprovider.store_backed());
     assert_eq!(nprovider.array_shape("t2m").unwrap(), None);
+
+    // a reader that can honour neither
+    let floader = DataSource::new("nei2016", "ff10", "https://data.earthsci.dev/ff10/x.csv");
+    let fprovider = Provider::new(floader, cache, None).unwrap();
+    assert!(!fprovider.supports_selection());
+    assert!(!fprovider.store_backed());
 }
 
 #[test]
@@ -249,10 +260,70 @@ fn per_call_select_on_whole_file_reader_errors() {
         .verify_on_read(true)
         .build()
         .unwrap();
-    let loader =
-        DataSource::new("era5", "netcdf", "https://data.earthsci.dev/era5/2018/11/20181108.nc");
+    // `ff10` honours no selection at all (`netcdf` now does, at decode time).
+    let loader = DataSource::new("nei2016", "ff10", "https://data.earthsci.dev/ff10/x.csv");
     let mut provider = Provider::new(loader, Arc::new(cache), None).unwrap();
     // A per-call projection on a reader that can't honour it is an error (pre-fetch).
     let sel = Selection::Orthogonal(vec![AxisSelect::All]);
     assert!(provider.materialize_with_select(Some(&sel)).is_err());
+}
+
+/// A BAKED `DataSource::select` on a reader that honours none is an error too,
+/// not a silently dropped selection — the Julia and Python tracks both refuse it,
+/// and a caller who reads the whole array believing it got a window has a wrong
+/// number, not a slow one. Raised before any fetch.
+#[test]
+fn baked_select_on_a_reader_that_honours_none_errors() {
+    let cache = Arc::new(
+        Cache::builder()
+            .data_dir(corpus_cache())
+            .offline(true)
+            .verify_on_read(true)
+            .build()
+            .unwrap(),
+    );
+    let loader = DataSource::new("nei2016", "ff10", "https://data.earthsci.dev/ff10/x.csv")
+        .select(Selection::Orthogonal(vec![AxisSelect::All]));
+    let mut provider = Provider::new(loader, cache, None).unwrap();
+    let err = provider.materialize().unwrap_err().to_string();
+    assert!(err.contains("does not support select"), "{err}");
+}
+
+/// The whole-file `netcdf` reader honours both, with the per-call `select`
+/// OVERRIDING the baked one for that call only — the same precedence the
+/// store-backed zarr reader has, and the same the Julia/Python tracks pin.
+#[test]
+fn netcdf_per_call_select_overrides_the_baked_one() {
+    let cache = Arc::new(
+        Cache::builder()
+            .data_dir(corpus_cache())
+            .offline(true)
+            .verify_on_read(true)
+            .build()
+            .unwrap(),
+    );
+    let baked = Selection::Orthogonal(vec![
+        AxisSelect::All,
+        AxisSelect::Range { start: 1, stop: 3, step: 1 },
+        AxisSelect::Indices(vec![0, 2]),
+    ]);
+    let loader =
+        DataSource::new("era5", "netcdf", "https://data.earthsci.dev/era5/2018/11/20181108.nc")
+            .select(baked);
+    let mut provider = Provider::new(loader, cache, None).unwrap();
+    assert!(provider.supports_selection() && !provider.store_backed());
+
+    // the baked selection is honoured with no per-call argument at all
+    assert_eq!(provider.materialize().unwrap()["t2m"].shape, vec![2, 2, 2]);
+
+    // a per-call select wins for this call only...
+    let peek = Selection::Orthogonal(vec![
+        AxisSelect::All,
+        AxisSelect::Indices(vec![0]),
+        AxisSelect::All,
+    ]);
+    let got = provider.materialize_with_select(Some(&peek)).unwrap();
+    assert_eq!(got["t2m"].shape, vec![2, 1, 3]);
+    // ...and it is a peek: the next plain read is the baked projection again.
+    assert_eq!(provider.materialize().unwrap()["t2m"].shape, vec![2, 2, 2]);
 }

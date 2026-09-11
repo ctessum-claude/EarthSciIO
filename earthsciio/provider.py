@@ -304,10 +304,13 @@ class Provider:
         native select shape, e.g. ``{"axes": [...]}`` with 0-based indices). When
         supplied it OVERRIDES any baked ``reader_kwargs["select"]`` for this call
         only, letting a caller (EarthSciAST) push a projection down at sample time
-        without rebuilding the provider. Only a store-backed reader can honour it
-        (:attr:`supports_selection`); passing ``select`` to a whole-file reader is
-        a :class:`ValueError`. A per-call ``select`` is a projection **peek** — it
-        does NOT disturb the cadence buffer / file cache the solver reads.
+        without rebuilding the provider. Any reader that answers
+        :attr:`supports_selection` can honour it — ``zarr`` by fetching only the
+        intersecting chunk objects, ``netcdf`` by materialising only the requested
+        hyperslab of the blob it already fetched; passing ``select`` to a reader
+        that cannot is a :class:`ValueError`. A per-call ``select`` is a projection
+        **peek** — it does NOT disturb the cadence buffer / file cache the solver
+        reads.
         """
         if self.loader.temporal is None:
             ds = self._read_file(self.loader.resolve_url(_EPOCH), select=select)
@@ -366,12 +369,25 @@ class Provider:
 
     @property
     def supports_selection(self) -> bool:
-        """True when the bound reader can honour an orthogonal ``select`` at read
-        time (projection pushdown) — a store-backed reader that fetches only the
-        selected chunks. False for whole-file readers. A caller uses this to decide
+        """True when the bound reader can honour an orthogonal ``select``
+        **without materialising the whole array**. A caller uses this to decide
         whether to push a projection down (``materialize(..., select=…)``) or to
-        read whole and slice on its own side."""
+        read whole and slice on its own side.
+
+        It says nothing about what is FETCHED — pair it with
+        :attr:`store_backed` for that: ``zarr`` (store-backed) fetches only the
+        intersecting chunk objects, so a selection shrinks the download too;
+        ``netcdf`` (whole-file) fetches the same blob under the same cache key
+        and only materialises the requested hyperslab."""
         return supports_selection(self._reader)
+
+    @property
+    def store_backed(self) -> bool:
+        """True when the bound reader reads a directory-like STORE (a Zarr v2
+        store, each object its own fetch) rather than one blob. Read with
+        :attr:`supports_selection` it tells a caller whether a pushed-down
+        ``select`` shrinks the DOWNLOAD or only the decode."""
+        return bool(getattr(self._reader, "store_backed", False))
 
     def array_shape(self, var: str) -> Optional[Tuple[int, ...]]:
         """The full native (dims-order) shape of on-disk array ``var``, for a
@@ -489,17 +505,24 @@ class Provider:
             return self._reader.read_store(
                 self.cache, url, variables, select=effective, **rest
             )
-        # Whole-file reader: it cannot honour a projection pushdown. A per-call
-        # `select` here is a clear error (the fetch-full fallback belongs to the
-        # EarthSciAST caller, not the reader). Raised before any fetch.
-        if select is not None:
+        # Whole-file reader. A `select` — per-call, else the baked one — reaches
+        # it only if it declares `supports_selection`; the netcdf reader does, and
+        # honours it at DECODE time (same blob, same cache key, only the requested
+        # hyperslab materialised). A reader that cannot is a clear error (the
+        # fetch-full fallback belongs to the EarthSciAST caller, not the reader),
+        # raised before any fetch.
+        effective = select if select is not None else reader_kwargs.get("select")
+        if effective is not None and not supports_selection(self._reader):
             raise ValueError(
                 f"reader {type(self._reader).__name__} does not support "
                 "select/pushdown"
             )
+        rest = {k: v for k, v in reader_kwargs.items() if k != "select"}
         entry = self._fetch(url)
         handle = self._reader.open(entry.path)
-        return self._reader.read_native(handle, variables, **reader_kwargs)
+        if effective is None:
+            return self._reader.read_native(handle, variables, **rest)
+        return self._reader.read_native(handle, variables, select=effective, **rest)
 
     def _file_for(self, file_anchor: _dt.datetime,
                   select: Optional[Any] = None) -> NativeDataset:

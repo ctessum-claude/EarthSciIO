@@ -205,6 +205,13 @@ def dump_case(case: Dict[str, Any]) -> Dict[str, Any]:
             reader_kwargs["null_int"] = int(dec["null_int"])
         if dec.get("null_string") is not None:
             reader_kwargs["null_string"] = str(dec["null_string"])
+    elif fmt == "netcdf":
+        # Whole-file, but selection-capable: a case carrying an orthogonal
+        # `select` is a DECODE-TIME window — the same blob under the same cache
+        # key, with only the requested hyperslab materialised. A case without
+        # `axes` reads the blob whole (the `{all_records: true}` form).
+        if (case.get("select") or {}).get("axes") is not None:
+            reader_kwargs["select"] = case["select"]
     elif fmt == "zarr":
         # Store-backed: the reader is handed (cache, base_url, variables, select).
         # `variables` names the arrays (no .zmetadata to enumerate); `select` (the

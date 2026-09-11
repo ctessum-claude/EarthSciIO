@@ -126,6 +126,13 @@ end
                     ns = get(dec, "null_string", nothing)
                     ns === nothing || (kw[:null_string] = String(ns))
                     (; kw...)
+                elseif fmt == "netcdf"
+                    # A netcdf case may pin a DECODE-TIME window: same blob, same
+                    # cache key, only the requested hyperslab materialised. A case
+                    # without `axes` (the `{all_records: true}` form) reads whole.
+                    sel = get(case, "select", nothing)
+                    axes = sel === nothing ? nothing : get(sel, "axes", nothing)
+                    axes === nothing ? NamedTuple() : (; select = sel)
                 else
                     NamedTuple()
                 end
@@ -213,6 +220,132 @@ end
     @test variable_names(pushed) == ["t2m"]
     @test isequal(pushed["t2m"].data, full["t2m"].data)
     @test coord_names(pushed) == coord_names(full)
+end
+
+@testset "netcdf reader — decode-time `select` (windowed read)" begin
+    era5_case = JSON.parsefile(joinpath(CORPUS, "cases", "era5-grid-sub-tile.json"))
+    blob = joinpath(CORPUS, era5_case["blob_path"])
+    reader = FORMAT_REGISTRY["netcdf"]
+    full = read_native(reader, blob)
+
+    # The acceptance gate: a windowed read equals the FULL read sliced afterwards,
+    # cell for cell — anything else is an off-by-one. `isequal` because the corpus
+    # blob carries a masked cell that decodes to NaN.
+    sel = Dict("axes" => Any["all", Dict("slice" => [1, 3]), Dict("indices" => [0, 2])])
+    w = read_native(reader, blob; select = sel)
+    for name in ("t2m", "sp")
+        @test isequal(w[name].data, full[name].data[:, 2:3, [1, 3]])
+        @test w[name].dims == full[name].dims          # dims are NAMES, not lengths
+        @test w[name].attrs == full[name].attrs
+    end
+
+    # Coordinates are sliced WITH the data — a windowed variable beside a
+    # full-length lon/lat would be a silent trap.
+    @test w["latitude"].data == full["latitude"].data[2:3]
+    @test w["longitude"].data == full["longitude"].data[[1, 3]]
+    @test w["time"].data == full["time"].data          # the time axis is untouched
+    @test w["time"].attrs == full["time"].attrs        # raw, with units + calendar
+
+    # An explicit index list is returned in the ORDER GIVEN (the zarr reader's
+    # rule): a reader that sorted the indices, or read a bounding slab and forgot
+    # to gather, fails here.
+    perm = read_native(reader, blob;
+                       select = Dict("axes" => Any["all", "all", Dict("indices" => [2, 0])]))
+    @test isequal(perm["t2m"].data, full["t2m"].data[:, :, [3, 1]])
+    @test perm["longitude"].data == full["longitude"].data[[3, 1]]
+
+    # `variables` and `select` compose: project, then window.
+    both = read_native(reader, blob; variables = ["t2m"], select = sel)
+    @test variable_names(both) == ["t2m"]
+    @test isequal(both["t2m"].data, full["t2m"].data[:, 2:3, [1, 3]])
+
+    # Time is the PROVIDER's axis (it owns the cadence), so a time selection is
+    # refused rather than quietly honoured.
+    e = try
+        read_native(reader, blob;
+                    select = Dict("axes" => Any[Dict("indices" => [0]), "all", "all"]))
+        nothing
+    catch err
+        err
+    end
+    @test e isa ArgumentError
+    @test occursin("time", sprint(showerror, e))
+
+    # An axis count matching no array is an error, not a silently ignored select.
+    @test_throws ArgumentError read_native(reader, blob;
+                                           select = Dict("axes" => Any["all", "all"]))
+
+    # A FULL-EXTENT selection must be the no-selection read, exactly — both
+    # spellings of "everything" still go down the windowed code path, so this is
+    # the read that catches an off-by-one in the slab planner.
+    for axes in (Any["all", Dict("slice" => [0, 3]), Dict("slice" => [0, 3])],
+                 Any["all", Dict("indices" => [0, 1, 2]), Dict("indices" => [0, 1, 2])])
+        everything = read_native(reader, blob; select = Dict("axes" => axes))
+        for name in ("t2m", "sp")
+            @test size(everything[name].data) == size(full[name].data)
+            @test isequal(everything[name].data, full[name].data)
+        end
+        for name in ("latitude", "longitude", "time")
+            @test everything[name].data == full[name].data
+        end
+    end
+
+    # This vocabulary NEVER drops a dimension: a one-index axis comes back at
+    # length 1, not squeezed away (a track that squeezed would diverge in rank).
+    for ax in (Dict("indices" => [1]), Dict("slice" => [1, 2]))
+        one = read_native(reader, blob; select = Dict("axes" => Any["all", ax, "all"]))
+        @test size(one["t2m"].data) == (2, 1, 3)
+        @test one["t2m"].dims == ["time", "latitude", "longitude"]
+        @test size(one["latitude"].data) == (1,)
+        @test isequal(one["t2m"].data, full["t2m"].data[:, 2:2, :])
+    end
+
+    # An axis may legally resolve to NOTHING: a zero-length axis, KEPT in `dims`.
+    # `extrema` of an empty index list would throw, and the sibling tracks return
+    # a correctly-shaped empty array here.
+    for ax in (Dict("indices" => Int[]), Dict("slice" => [1, 1]), Dict("slice" => [2, 0]))
+        none = read_native(reader, blob; select = Dict("axes" => Any["all", ax, "all"]))
+        for name in ("t2m", "sp")
+            @test size(none[name].data) == (2, 0, 3)
+            @test none[name].dims == ["time", "latitude", "longitude"]
+        end
+        @test size(none["latitude"].data) == (0,)
+        # ...and the axes NOT selected keep their full length.
+        @test size(none["longitude"].data) == (3,)
+        @test size(none["time"].data) == (2,)
+    end
+
+    # A slice is bounds-checked like an `indices` list: an over-long window is an
+    # error, never a silent clamp, and a negative bound never wraps around.
+    for ax in (Dict("slice" => [1, 99]), Dict("slice" => [-2, 3]), Dict("indices" => [5]))
+        e = try
+            read_native(reader, blob; select = Dict("axes" => Any["all", ax, "all"]))
+            nothing
+        catch err
+            err
+        end
+        @test e !== nothing
+        @test occursin("out of range", sprint(showerror, e))
+    end
+
+    # Through the Provider, per-call and baked, on a reader that is NOT
+    # store-backed: same blob, same cache key, only the hyperslab materialised.
+    cache = Cache(LocalStore(joinpath(CORPUS, "cache")); offline = true, verify = true)
+    p = const_provider(cache, era5_case["resolved_url"]; format = "netcdf")
+    @test supports_selection(p)
+    @test !store_backed(p)
+    m = materialize(p; select = sel)
+    @test isequal(m["t2m"].data, full["t2m"].data[:, 2:3, [1, 3]])
+    @test m["latitude"].data == full["latitude"].data[2:3]
+    # ...and the per-call select is a peek: the next plain read is the full array.
+    @test size(materialize(p)["t2m"].data) == size(full["t2m"].data)
+
+    pb = const_provider(cache, era5_case["resolved_url"]; format = "netcdf",
+                        reader_kwargs = (; select = sel))
+    @test isequal(materialize(pb)["t2m"].data, full["t2m"].data[:, 2:3, [1, 3]])
+    # a per-call select OVERRIDES the baked one
+    @test size(materialize(pb; select = Dict("axes" => Any["all", "all", "all"]))["t2m"].data) ==
+          size(full["t2m"].data)
 end
 
 @testset "reader edge cases" begin
