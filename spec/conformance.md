@@ -33,6 +33,8 @@ data tooling beyond the format reader.
 |---|---|---|---|---|---|---|
 | `era5-grid-sub-tile` | era5 | grid | netcdf | file | local | CF scale/offset + `_FillValue`→NaN + a masked cell; packed int16 → float64 |
 | `era5-window-slice` | era5 | grid | netcdf | file | local | the **same blob and cache key** as `era5-grid-sub-tile`, read through a **decode-time `select`** (lat `{slice:[1,3]}`, lon `{indices:[0,2]}`, time `"all"`). Pins that a whole-file reader materialises only the hyperslab and returns exactly the full read sliced afterwards, that the lat/lon **coordinates are sliced with the data**, that the masked cell still decodes to NaN inside the window, that the time axis is untouched and raw — and that a selection changes the decode, never the fetch |
+| `station-labels-text` | openaq | points | netcdf | file | local | **NetCDF text variables**, all three readings in one blob: `char site_id(site, strlen)` on a private `strlen` is 4 **strings** on `dims ["site"]` (length consumed, trailing NULs stripped, the trailing space of `"cd  "` kept as data, an all-NUL row `""`); `char flag(site)` shares `site` with `float64 value(site)` so `site` is a real axis and every cell is its own **one-character** string (its NUL cell `""`); `char title(titlelen)` alone on a private dimension is a **scalar** string (`dims []`). The rule is about the file, not the variable |
+| `station-labels-window` | openaq | points | netcdf | file | local | the **same blob and cache key** as `station-labels-text` under a one-axis `select` (`{indices:[0,2]}`). Pins that a text field is windowed like any other — `site_id` and `flag` lose the cells `value` loses — and that the positional axis match is over the **decoded** field's dims: `site_id` is rank 1 on two on-disk dimensions and the scalar `title` is rank 0 and untouched. Counting on-disk dims would bind the selector to `titlelen` too and return `"h"` for `title` |
 | `openaq-points-slice` | openaq | points | csv | file | local | a 2nd reader behind the `format` registry; numeric→float64, text→string |
 | `ff10-point-slice` | nei2016 | points | ff10 | file | local | FF10 point long-format: `#` header skipped, fixed 77-col schema, RFC-4180 quoted `FACILITY_NAME`, numeric→float64 (blank→NaN), ids/codes→string; 3 rows share one stack (no pivot). member=null decodes the extracted CSV member |
 | `ff10-zip-egu-glob` | nei2016 | points | ff10 | file | local | EPA-2016fd-shaped **zip** of FF10 members (two `*egu*` + one excluded + a glob-matching **directory placeholder** entry, ignored), each member with a non-comment `country_cd,…` header line. Pins `member_glob` selection (exclusion, **sorted member-name concatenation**) + `skip_header_row` (one asserted header line dropped per member). The blob is the whole zip; member selection is reader config, never part of the cache key |
@@ -133,14 +135,16 @@ Every reader MUST decode identically, or cross-language equality fails. Pinned:
 
   This is what xarray produces (its `CharacterArrayCoder`, gated on
   `conventions.stackable`), which makes the Python track the reference for these
-  bytes. **Julia (NCDatasets) does not yet follow it** — it returns a raw `Char`
-  array of the full on-disk shape, so a 2-D `char` variable comes back as an
-  `n × strlen` matrix rather than `n` strings. That is an open divergence, not a
-  sanctioned one. It has a second face under a `select`: because that Julia field
-  keeps its string-length dimension, it still counts as **rank 2** for the
-  positional axis match the selection notes below require to be over decoded
-  fields. Both faces close together, when the Julia reader learns the
-  convention — the rule below is the one all three tracks are held to.
+  bytes. All three tracks now produce it: neither NCDatasets nor `netcdf-reader`
+  applies the convention itself (both hand back the raw characters of the full
+  on-disk shape), so the Julia and Rust readers apply it above their backend, and
+  `station-labels-text` pins the result three-way. Its second face is under a
+  `select`: a `char label(n, strlen)` is a **rank-1 field on two on-disk
+  dimensions**, so the positional axis match the selection notes below require
+  must count the DECODED field's dims. A track that counted on-disk dims would
+  let that variable answer for rank 2, bind an axis to a string LENGTH, and then
+  apply that selector by name to every other array in the blob —
+  `station-labels-window` pins that too.
 - **FF10 zip member selection** — an `ff10` blob may be a `.zip`; the reader's
   `member` (singular), `members` (explicit list), and `member_glob`
   (fnmatch-style `*`/`?`/`[...]`, case-sensitive, matched against the full

@@ -157,6 +157,8 @@ the oracle [`verify.py`](verify.py).
 | case | format | python | julia | rust |
 |---|---|---|---|---|
 | `era5-grid-sub-tile` | netcdf | ✅ | ✅ | ✅ (three-way) |
+| `station-labels-text` | netcdf | ✅ | ✅ | ✅ (three-way) |
+| `station-labels-window` | netcdf | ✅ | ✅ | ✅ (three-way) |
 | `openaq-points-slice` | csv | ✅ | ✅ | ⊘ no reader |
 | `ff10-point-slice` | ff10 | ✅ | ✅ | ✅ (three-way) |
 | `ff10-zip-egu-glob` | ff10 | ✅ | ✅ | ✅ (three-way) |
@@ -164,6 +166,12 @@ the oracle [`verify.py`](verify.py).
 | `permuted-order-tile` | zarr | ✅ | ✅ | ✅ (three-way) |
 | `shapefile-polygon-zip` | shapefile | ✅ | ✅ | ✅ (three-way) |
 | `moves-rate-table-parquet` | parquet | ✅ | ✅ | ✅ (three-way) |
+
+The two `station-labels-*` cases are the TEXT ones: they are where a netcdf
+`char` variable's three readings (a consumed string length, a shared axis, a
+scalar string) and the `string` dtype of the dump schema are cross-checked, and
+where a `select`'s positional axis match is proven to count the DECODED field's
+dims — `char site_id(site, strlen)` is rank 1 on two on-disk dimensions.
 
 The parquet case is the columnar one: it is where the reader OPTIONS
 (`float_columns`, `null_int`, `null_string`) and the `variables` projection are

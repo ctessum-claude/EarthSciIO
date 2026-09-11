@@ -1,0 +1,89 @@
+{
+  "schema": "earthsciio/cache-case/v1",
+  "id": "station-labels-window",
+  "loader": "openaq",
+  "kind": "points",
+  "format": "netcdf",
+  "transport": "file",
+  "store": "local",
+  "resolved_url": "https://data.earthsci.dev/openaq/stations/monitor-metadata.nc",
+  "cache_key": "5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587",
+  "blob_path": "cache/v1/blobs/5d/5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587.nc",
+  "manifest_path": "cache/v1/meta/5d359ad5a4446e41a1c522c1f2dc4f4409ad337a2a5b3865dafdbae047b5c587.json",
+  "content_sha256": "1731d104cdeab584735169f415359b42e3eb9b95c40aa0499b541d54ab2c2436",
+  "bytes": 324,
+  "select": {
+    "axes": [
+      {
+        "indices": [
+          0,
+          2
+        ]
+      }
+    ]
+  },
+  "decode": {
+    "char_stacking": true,
+    "nul_stripped": true,
+    "fill_to_nan": false,
+    "time_decoded": false,
+    "decode_time_select": true
+  },
+  "expected": {
+    "variables": {
+      "value": {
+        "dtype": "float64",
+        "dims": [
+          "site"
+        ],
+        "shape": [
+          2
+        ],
+        "fill_value": null,
+        "data": [
+          12.5,
+          14.25
+        ]
+      },
+      "site_id": {
+        "dtype": "string",
+        "dims": [
+          "site"
+        ],
+        "shape": [
+          2
+        ],
+        "fill_value": null,
+        "data": [
+          "ab",
+          "efgh"
+        ]
+      },
+      "flag": {
+        "dtype": "string",
+        "dims": [
+          "site"
+        ],
+        "shape": [
+          2
+        ],
+        "fill_value": null,
+        "data": [
+          "a",
+          "c"
+        ]
+      },
+      "title": {
+        "dtype": "string",
+        "dims": [],
+        "shape": [],
+        "fill_value": null,
+        "data": [
+          "hi"
+        ]
+      }
+    },
+    "coords": {}
+  },
+  "notes": "The SAME blob and cache key as station-labels-text, read through a ONE-axis decode-time `select` ({indices:[0,2]}). Pins that a text field is windowed like any other \u2014 `site_id` and `flag` lose the same cells `value` loses \u2014 and that the positional axis match is over the DECODED field's dims: `site_id` is RANK 1 on TWO on-disk dimensions, and the scalar `title` is RANK 0 and untouched. A track that counted on-disk dimensions would bind this selector to `titlelen` as well and hand back \"h\" for `title` \u2014 a wrong STRING, invisible to every shape assertion."
+}

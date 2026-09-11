@@ -85,6 +85,21 @@ def _encode_field(field: Any) -> Dict[str, Any]:
     if isinstance(data, np.ndarray):
         flat = np.asarray(data).reshape(-1)
         shape = list(data.shape)
+        if flat.dtype.kind in ("S", "U"):
+            # A netcdf TEXT variable (spec/conformance.md §3): xarray decodes a
+            # `char` array to fixed-width BYTES (`|S4`) and an `NC_STRING` to
+            # `<U`, both of them `string` fields in the dump schema. They must go
+            # through the string branch, not the numeric one: `int(b'ab')` is a
+            # TypeError, which is why no corpus case could carry a char variable
+            # before. `shape` is the field's own, so a SCALAR string (a `char
+            # label(strlen)` on a private dimension) keeps `shape == []` while its
+            # one value still flattens to a one-element `data` list.
+            values = [
+                v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                for v in flat.tolist()
+            ]
+            enc = {"dtype": "string", "dims": dims, "shape": shape, "data": values}
+            return _with_fill_value(enc, field)
         if np.issubdtype(flat.dtype, np.floating):
             values: List[Any] = [
                 None if (math.isnan(x)) else float(x) for x in flat.tolist()
