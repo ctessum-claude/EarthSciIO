@@ -84,8 +84,12 @@ interface Reader:
     open(blob_path: Path) -> Handle
     read_native(handle: Handle,
                 variables: [string],              # file_variable names to read
-                select: Selection) -> { string: NativeField }   # + coords
+                select: Selection,
+                records: Records?) -> { string: NativeField }   # + coords
+    dim_length(path: Path, dim: string) -> int?    # header only (§2.3)
     configured(options: {string: any}) -> Reader?  # loader-declared decode options
+
+Records = { dim: string, indices: [int] }          # 0-based, file-local (§2.1)
 
 NativeField = { dtype, dims: [string], shape: [int], data, fill_value? }
 ```
@@ -110,9 +114,24 @@ selection or a mis-parsed table, arbitrarily far from its cause. Reader options
 never enter the cache key (the blob is the whole file; member selection and
 header handling are decode-side).
 
+**Per-track availability is machine-readable, not prose.** `registries.json`
+carries a `reader_options` array on the format entry, and each option lists the
+`tracks` that really provide it (plus `extensions` for anything one track adds
+in process, and `used_by_provider` for whether each track's *Provider* chooses
+to use it). This file's tables are the explanation; that array is the contract.
+The reason is specific: an out-of-process caller reads `registries.json` to
+decide what to ask a binding for, so an option advertised there and implemented
+in one track only reads back as a `TypeError`/`MethodError` in the others — and
+**no conformance case can catch that**, because a corpus case pins decoded
+ARRAYS and a missing option produces no array to compare. Each track therefore
+asserts the file's claims about *itself* against its own readers
+(`tests/test_registry_dispatch.py`, `julia/test/test_registries.jl`,
+`rust/tests/registry_spec.rs`); all three read the same file, which is what makes
+the three tracks' claims about each other checkable.
+
 | name | ext | status | notes |
 |---|---|---|---|
-| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present. **`select` is honoured at DECODE time**: the same blob is fetched under the same cache key and only the requested hyperslab is materialised, so `supports_selection` is true while `store_backed` stays false. Axes are the shared 0-based vocabulary (`"all"`/`{indices}`/`{slice}`), positional over file-order dims of the **decoded fields** whose rank matches, then applied by dimension NAME to every array **and every coordinate**; a time axis that is not `"all"` is refused (record selection is the Provider's). **TEXT variables are `string` fields in every track** (a `char` array, a NetCDF-4 `NC_STRING`), never skipped by any of them: a `char` variable's last dimension is the string LENGTH exactly when nothing else claims it as an axis, so `char label(n, strlen)` is n NUL-stripped strings and a 1-D `char label(strlen)` on a private dimension is a scalar string, while `char label(n)` beside a `float value(n)` stays n one-character strings. A consumed string length is not an axis: it never enters the positional rank match (`char label(n, strlen)` is RANK 1) and a selection naming one is an error, not a silent truncation of every string. **`records = {dim, indices}` is how the Provider then pushes the records it chose** (Julia track today): absolute, file-local, 0-based, honoured in the order given, duplicates legal, out-of-range an error — the reader is told the records and never the cadence. `dim_length` (§2.3) is the metadata read that makes those indices computable before the decode. See [conformance.md](conformance.md#decode) "NetCDF decode notes" |
+| `netcdf` | `nc`,`nc4`,`cdf` | **active** | CF decode (§decode in [conformance.md](conformance.md#decode)). **`variables` is a projection pushed into the decode** in all three tracks: an unrequested data variable is never decoded (a GEOS-FP A1 file carries 47 of them and a loader wants one), coordinates are always returned, an empty list reads every variable, and a requested name absent from the blob is an error listing what is present. **`select` is honoured at DECODE time**: the same blob is fetched under the same cache key and only the requested hyperslab is materialised, so `supports_selection` is true while `store_backed` stays false. Axes are the shared 0-based vocabulary (`"all"`/`{indices}`/`{slice}`), positional over file-order dims of the **decoded fields** whose rank matches, then applied by dimension NAME to every array **and every coordinate**; a time axis that is not `"all"` is refused (record selection is the Provider's). **TEXT variables are `string` fields in every track** (a `char` array, a NetCDF-4 `NC_STRING`), never skipped by any of them: a `char` variable's last dimension is the string LENGTH exactly when nothing else claims it as an axis, so `char label(n, strlen)` is n NUL-stripped strings and a 1-D `char label(strlen)` on a private dimension is a scalar string, while `char label(n)` beside a `float value(n)` stays n one-character strings. A consumed string length is not an axis: it never enters the positional rank match (`char label(n, strlen)` is RANK 1) and a selection naming one is an error, not a silent truncation of every string. **`records = {dim, indices}` is how the Provider then pushes the records it chose** (all three tracks; `registries.json` `reader_options` is the machine-readable per-track list): absolute, file-local, 0-based, honoured in the order given, duplicates legal, out-of-range / unknown dim / empty list / a `select` narrowing the same dim all errors — the reader is told the records and never the cadence. Julia's `indices` additionally accepts a `len -> indices` callable resolved inside the reader's own open; that is an in-process convenience, the LIST is the wire form, and Python/Rust refuse a callable by name. Which track's Provider USES the option is a separate, per-track performance decision recorded in `used_by_provider`, not a contract term: Julia's Provider pushes down (it computes the record from the cadence and keeps no decoded-file buffer), while Python's and Rust's keep a 2-entry LRU of decoded files that amortises one whole-file decode over every tick in the file, so pushing down would replace one decode per FILE with one per TICK (measured 25.7x/3.0x per-tick worse in Python and 5.3x/2.3x in Rust on 24-record A1-shaped and 8-record A3dyn-shaped files). A `records` baked into a loader's `reader_kwargs` beside a cadence is refused at construction in every track: it would narrow the record axis behind the Provider's own tick→record resolution, so every tick would read the same record and a 2-record bracket would degenerate to a constant field with no error anywhere. `dim_length` (§2.3) is the metadata read that makes those indices computable before the decode. See [conformance.md](conformance.md#decode) "NetCDF decode notes" |
 | `geotiff` | `tif`,`tiff` | **active** | raster bands via GDAL; Py first, Jl/Rs may lag (R5) |
 | `csv` | `csv` | **active** | points: numeric cols → float64, others → string |
 | `json` | `json` | **active** | points (e.g. station-discovery payloads) |
@@ -169,10 +188,17 @@ side" rather than as an error. `dim_length` is what makes a `records` pushdown
 (`conformance.md`, "NetCDF decode notes") expressible out of process at all: the
 records a cadence owner wants are `mod1(tick, len)` of the file's own record axis,
 so `len` has to be known before the decode that the selection is meant to narrow.
+All three tracks answer it for `netcdf` (`registries.json`
+`format.netcdf.metadata_queries` is the machine-readable list).
+
 In process, that costs a second open of the blob — **measured at 16.9 ms on a
 GEOS-FP A1 file against the 2.9 ms the record selection saves there** — which is
-why the `records` option also accepts a `len -> indices` callable resolved inside
-the decode's own open, and why the Provider uses that form.
+why the `records` option ALSO accepts a `len -> indices` callable resolved inside
+the decode's own open in the Julia track, whose Provider pushes down on every
+sample and would otherwise pay that second open per sample. The list stays the
+wire form and the only portable one: Python and Rust refuse a callable by name,
+because a spelling that cannot cross a process boundary has no place in a
+contract an out-of-process caller reads.
 
 
 ---

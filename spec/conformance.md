@@ -451,7 +451,8 @@ chunks out of the already-fetched blob. The reader therefore declares
   whose time axis is anything but `"all"` is **refused**. A dimension is the time
   axis when a same-named coordinate carries CF `"<step> since <ref>"` units, or
   when it is literally named `time`.
-- **`records` is how that axis IS narrowed** (Julia track today) — the refusal
+- **`records` is how that axis IS narrowed** (all three tracks; `registries.json`
+  `format.netcdf.reader_options` is the machine-readable per-track list) — the refusal
   above says the reader may not *choose* records, not that every record must be
   decoded. `records = {dim: "<name>", indices: [<0-based>, …]}` is a second,
   deliberately separate decode option through which the cadence owner states the
@@ -462,13 +463,28 @@ chunks out of the already-fetched blob. The reader therefore declares
   Duplicates are legal — the end-of-data bracket `[last, last]` is one — and an
   index outside `0:len-1`, a `dim` the blob lacks, an empty list, or a `select`
   that narrows the same `dim` are all errors rather than a wrapped or widened
-  read. `dim_length(reader, path, dim)` (`registries.md` §2.3) is the metadata
-  read that lets an out-of-process caller compute those indices; in process
-  `indices` may instead be a `len -> indices` callable resolved inside the
-  decode's own open, so the cadence owner does not pay a second open per sample
-  (a blob with no such `dim` does not call it and narrows nothing). The gate is
+  read. `dim_length(reader, path, dim)` (`registries.md` §2.3, answered by all
+  three tracks) is the metadata read that lets an out-of-process caller compute
+  those indices. **The list is the wire form.** In the Julia track `indices` may
+  instead be a `len -> indices` callable resolved inside the decode's own open,
+  so a Provider that pushes down on every sample does not pay a second open per
+  sample (a blob with no such `dim` does not call it and narrows nothing); that
+  is an in-process convenience, and Python and Rust refuse a callable by name
+  rather than accept a spelling that cannot cross a process boundary. The gate is
   the same as the window's: a record-selected read must be cell-for-cell
   identical to the full read sliced afterwards.
+- **Whether a Provider USES it is a per-track performance decision**, not a
+  contract term — the option behaves identically everywhere, and
+  `registries.json` records the choice per track in `used_by_provider`. The Julia
+  Provider pushes down: it computes the record from the cadence and keeps no
+  decoded-file buffer, so the pushdown is a pure win. The Python and Rust
+  Providers keep a 2-entry LRU of decoded files and amortise ONE whole-file
+  decode over every tick in the file, so pushing down would replace one decode
+  per FILE with one per TICK — measured 25.7x/3.0x worse per tick in Python and
+  5.3x/2.3x in Rust, on 24-record A1-shaped and 8-record A3dyn-shaped files. A
+  track may not be made slower in the name of symmetry; what parity requires is
+  that the READER honour the option identically, which is what the equivalence
+  gate above tests in each track.
 - **One owner per record axis.** `records` is the cadence owner's option, so a
   Provider that owns a record axis (it has a `time_dim`, and resolves each tick
   to a file-local record itself) must **refuse** a `records` supplied by its
@@ -479,9 +495,10 @@ chunks out of the already-fetched blob. The reader therefore declares
   returns the same record and a 2-record bracket degenerates to `[r, r]` — a
   constant field where the model expected to interpolate. That is a silently
   wrong number, which is never a permitted divergence, so it is an error at
-  provider construction (`registries.md` §2.1). An explicit "off" value (Julia:
-  `records = nothing`) may stay legal as an opt-out that reads the record axis
-  whole and slices afterwards — the two paths must agree cell for cell.
+  provider construction (`registries.md` §2.1), in every track that lets a
+  `records` be declared at all. An explicit "off" value (`records = nothing` /
+  `records = None`) stays legal as an opt-out that reads the record axis whole
+  and slices afterwards — the two paths must agree cell for cell.
 - **An axis count matching no array is an error**, never a silently ignored
   selection.
 - **The decode is unchanged by the window** — CF `scale_factor`/`add_offset` in

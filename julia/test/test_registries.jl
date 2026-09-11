@@ -49,3 +49,62 @@ end
     @test store_backed(FORMAT_REGISTRY["zarr"])          # handed (cache, base_url)
     @test !store_backed(FORMAT_REGISTRY["netcdf"])       # whole-file readers untouched
 end
+
+# --- per-track option parity (spec/registries.json) --------------------------
+#
+# `spec/registries.json` is the MACHINE-READABLE contract an out-of-process
+# caller reads, and it now says which decode options and metadata queries each
+# TRACK provides. This asserts the Julia track really provides the ones it is
+# listed under.
+#
+# The gap it closes: a decode option advertised in that file but implemented in
+# one binding only reads back as a `MethodError` in the others, and nothing in
+# the conformance corpus can catch it — a corpus case pins DECODED ARRAYS, and an
+# option that does not exist produces no array to compare. The peers are
+# `tests/test_registry_dispatch.py` and `rust/tests/registry_spec.rs`; all three
+# read this same file, which is what makes the three tracks' claims about each
+# other checkable.
+@testset "registries.json — the options it declares for Julia are Julia's" begin
+    spec = JSON.parsefile(joinpath(@__DIR__, "..", "..", "spec", "registries.json"))
+    entries = spec["registries"]["format"]["entries"]
+    checked = String[]
+    for entry in entries
+        haskey(entry, "reader_options") || continue
+        push!(checked, entry["name"])
+        for opt in entry["reader_options"]
+            @test issubset(Set(opt["tracks"]), Set(["python", "julia", "rust"]))
+        end
+        want = Set(Symbol(o["name"]) for o in entry["reader_options"]
+                   if "julia" in o["tracks"])
+        have = Set(reader_option_keys(FORMAT_REGISTRY[entry["name"]]))
+        @test want == have
+    end
+    # ...and the file really does declare them for the reader this PR is about,
+    # so a `reader_options` block silently dropped from it cannot pass this.
+    @test "netcdf" in checked
+
+    # A declared metadata query must be ANSWERED here, not inherited from the
+    # "I cannot answer that" fallback every reader gets for free.
+    generic = which(EarthSciIO.dim_length, Tuple{Nothing,String,String})
+    for entry in entries
+        for q in get(entry, "metadata_queries", Any[])
+            "julia" in q["tracks"] || continue
+            @test q["name"] == "dim_length"     # the only one this shape describes
+            reader = FORMAT_REGISTRY[entry["name"]]
+            m = which(EarthSciIO.dim_length, Tuple{typeof(reader),String,String})
+            @test m !== generic
+        end
+    end
+
+    # The specific claim PR #4 could not make honestly: `records` is real in all
+    # three tracks, while which Providers USE it stays a separate, per-track
+    # performance decision (the Julia Provider does; Python and Rust keep a
+    # decoded-file buffer that a per-tick narrowed decode would throw away).
+    netcdf = only(e for e in entries if e["name"] == "netcdf")
+    records = only(o for o in netcdf["reader_options"] if o["name"] == "records")
+    @test Set(records["tracks"]) == Set(["python", "julia", "rust"])
+    @test records["used_by_provider"] ==
+          Dict("julia" => true, "python" => false, "rust" => false)
+    # The `len -> indices` callable is Julia's alone, and the file says so.
+    @test collect(keys(records["extensions"])) == ["julia"]
+end

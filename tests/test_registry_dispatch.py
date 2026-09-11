@@ -219,6 +219,81 @@ def test_registered_stubs_appear_in_spec():
                 assert name in spec_stub_names, f"{kind} stub {name!r} absent from spec"
 
 
+# --------------------------------------------------------------------------- #
+# 5b. Per-track option parity: `spec/registries.json` says which decode options
+# and metadata queries each TRACK provides, and this asserts the Python track
+# really provides the ones it is listed under.
+#
+# The gap this closes: the spec file is the machine-readable contract an
+# out-of-process caller reads. A decode option advertised there but implemented
+# in one binding only reads back as a `TypeError` in the others, and nothing in
+# the conformance corpus can catch it — a corpus case pins DECODED ARRAYS, and an
+# option that does not exist produces no array to compare. The peer assertions
+# are `julia/test/test_registries.jl` and `rust/tests/registry_spec.rs`; all
+# three read this same file, which is what makes the three tracks' claims about
+# each other checkable.
+# --------------------------------------------------------------------------- #
+
+
+def _spec_format_entry(name: str) -> dict:
+    return next(e for e in _spec_entries()["format"]["entries"] if e["name"] == name)
+
+
+def test_declared_reader_options_are_the_python_readers_own():
+    """Every option `registries.json` lists for the `python` track is one this
+    track's reader really takes, and every option it takes is listed."""
+    import inspect
+
+    for entry in _spec_entries()["format"]["entries"]:
+        declared = entry.get("reader_options")
+        if declared is None:
+            continue
+        for opt in declared:
+            assert set(opt["tracks"]) <= {"python", "julia", "rust"}, opt["name"]
+        want = {o["name"] for o in declared if "python" in o["tracks"]}
+        reader = format_registry.create(entry["name"])
+        # The whole signature, not `reader_option_names`: `variables` is a
+        # declared decode option of the format that Python happens to pass
+        # positionally, and the spec describes the FORMAT, not one binding's
+        # calling convention.
+        params = inspect.signature(reader.read_native).parameters
+        have = {
+            n
+            for n, p in params.items()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and n != "handle"
+        }
+        assert want == have, (
+            f"{entry['name']}: registries.json declares {sorted(want)} for the "
+            f"python track, the reader takes {sorted(have)}"
+        )
+
+
+def test_declared_metadata_queries_are_answerable_in_python():
+    """A metadata query listed for the `python` track must exist on the reader —
+    `dim_length` is what lets an out-of-process caller compute a `records`
+    pushdown's indices without decoding an array."""
+    for entry in _spec_entries()["format"]["entries"]:
+        for q in entry.get("metadata_queries", []):
+            if "python" not in q["tracks"]:
+                continue
+            reader = format_registry.create(entry["name"])
+            assert callable(getattr(reader, q["name"], None)), (
+                f"{entry['name']}: registries.json declares {q['name']} for the "
+                "python track, but the reader has no such method"
+            )
+
+
+def test_the_records_pushdown_is_declared_for_every_track():
+    """The specific claim PR #4 could not make honestly: `records` is real in all
+    three tracks, and which Providers USE it is recorded separately, as the
+    per-track performance decision it is."""
+    netcdf = _spec_format_entry("netcdf")
+    records = next(o for o in netcdf["reader_options"] if o["name"] == "records")
+    assert set(records["tracks"]) == {"python", "julia", "rust"}
+    # The Provider-side pushdown is a different claim, and is NOT universal.
+    assert records["used_by_provider"] == {"julia": True, "python": False, "rust": False}
+
+
 def test_stub_lookup_keys_match_spec():
     """Transport/format stub lookup keys (schemes/extensions) match the spec."""
     spec = _spec_entries()
