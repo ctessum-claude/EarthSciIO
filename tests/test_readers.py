@@ -23,6 +23,8 @@ import pytest
 from earthsciio import Cache, CSVReader, FF10Reader, NetCDFReader
 from earthsciio.native import NativeDataset
 from earthsciio.readers import FF10_POINT_COLUMNS, FF10_POINT_NUMERIC
+from earthsciio.provider import reader_option_names
+from earthsciio.registry import dim_length as registry_dim_length
 from earthsciio.registry import format_registry
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -307,6 +309,204 @@ def test_netcdf_select_refuses_an_out_of_range_slice(offline_cache):
     with pytest.raises(IndexError, match="out of range"):
         reader.read_native(reader.open(blob.path), None,
                            {"axes": ["all", {"indices": [5]}, "all"]})
+
+
+# --------------------------------------------------------------------------- #
+# NetCDF `records` pushdown — the cadence owner's record axis.
+#
+# The other half of the refused-time-axis rule above: a `select` may not CHOOSE
+# records, but the owner of the cadence may say which ones it wants. The corpus
+# blob holds two records, where a two-record bracket IS the whole axis and a
+# narrowed decode cannot be told from a full one, so the equivalence sweep below
+# runs on a synthetic FOUR-record file where every selection is a real subset.
+# Mirrors `julia/test/test_readers.jl` and the Rust `format::netcdf::tests`.
+# --------------------------------------------------------------------------- #
+
+
+def _write_cadence_nc(path, nrec: int) -> pathlib.Path:
+    """A 4-record cadence file: `t2m(time, lat, lon)` whose every cell is
+    distinct in the record AND in both spatial axes (so a record read out of
+    order, de-duplicated or off by one is a wrong NUMBER, not a wrong shape),
+    beside an `orog(lat, lon)` that carries no record axis at all."""
+    netCDF4 = pytest.importorskip("netCDF4")
+    with netCDF4.Dataset(str(path), "w", format="NETCDF3_CLASSIC") as ds:
+        ds.createDimension("time", nrec)
+        ds.createDimension("lat", 2)
+        ds.createDimension("lon", 3)
+        t = ds.createVariable("time", "f8", ("time",))
+        t.units = "hours since 2018-11-09 00:00:00"
+        t.calendar = "standard"
+        t[:] = np.arange(nrec, dtype="f8")
+        la = ds.createVariable("lat", "f8", ("lat",))
+        la[:] = [40.0, 41.0]
+        lo = ds.createVariable("lon", "f8", ("lon",))
+        lo[:] = [-90.0, -89.0, -88.0]
+        v = ds.createVariable("t2m", "f8", ("time", "lat", "lon"))
+        r, i, j = np.meshgrid(np.arange(nrec), np.arange(2), np.arange(3), indexing="ij")
+        v[:] = 100 * (r + 1) + 10 * i + j
+        o = ds.createVariable("orog", "f8", ("lat", "lon"))
+        o[:] = [[7.0, 8.0, 9.0], [8.0, 9.0, 10.0]]
+    return path
+
+
+@pytest.fixture
+def cadence_blob(tmp_path):
+    return _write_cadence_nc(tmp_path / "cadence.nc", 4)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_dim_length_reads_the_header(cadence_blob, offline_cache):
+    """The metadata-only half of the pushdown (``spec/registries.md`` §2.3): the
+    records a cadence owner wants are a function of the file's length along the
+    record axis, so that length has to be knowable BEFORE the decode the
+    selection is meant to narrow. It reads the header, never an array."""
+    reader = NetCDFReader()
+    assert reader.dim_length(cadence_blob, "time") == 4
+    assert reader.dim_length(cadence_blob, "lon") == 3
+    assert reader.dim_length(cadence_blob, "no-such-dim") is None
+    blob = offline_cache.fetch(ERA5_URL)
+    assert reader.dim_length(blob.path, "time") == 2
+    # the registry generic answers for a reader that implements it...
+    assert registry_dim_length(reader, cadence_blob, "time") == 4
+    # ...and "I cannot answer that" for every reader that does not.
+    assert registry_dim_length(CSVReader(), cadence_blob, "time") is None
+    # `records` is a DECLARED option of this reader, which is what tells a
+    # caller (and the cross-track parity check) that it is real in this track.
+    assert "records" in reader_option_names(reader)
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_records_equal_the_whole_file_read(cadence_blob):
+    """THE equivalence gate: a record-selected read is cell-for-cell the
+    whole-file read gathered afterwards, for every selection a cadence owner can
+    produce — a single record, an interior bracket, a reversed pair, the
+    degenerate end-of-data ``[last, last]``, the whole axis, a permutation."""
+    reader = NetCDFReader()
+    whole = reader.read_native(reader.open(cadence_blob))
+    w_t2m = np.asarray(whole["t2m"].data)
+    w_time = np.asarray(whole["time"].data)
+
+    sweeps = [[a] for a in range(4)]
+    sweeps += [[a, b] for a in range(4) for b in range(4)]
+    sweeps += [[0, 1, 2, 3], [3, 1, 2, 0]]
+    for idx in sweeps:
+        got = reader.read_native(
+            reader.open(cadence_blob), records={"dim": "time", "indices": idx}
+        )
+        # The axis is RETAINED at the requested length and never dropped.
+        assert list(got["t2m"].dims) == ["time", "lat", "lon"], idx
+        assert np.asarray(got["t2m"].data).shape == (len(idx), 2, 3), idx
+        assert np.array_equal(np.asarray(got["t2m"].data), w_t2m[idx]), idx
+        # the record axis's own coordinate moves WITH the data...
+        assert np.array_equal(np.asarray(got["time"].data), w_time[idx]), idx
+        assert got["time"].attrs == whole["time"].attrs, idx
+        # ...untouched axes stay whole, and a field with no record axis passes
+        # through unchanged.
+        assert np.array_equal(np.asarray(got["lat"].data), np.asarray(whole["lat"].data))
+        assert np.array_equal(np.asarray(got["orog"].data), np.asarray(whole["orog"].data))
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_records_are_absolute_ordered_and_may_repeat(cadence_blob):
+    """Pinned ABSOLUTE values, so the sweep above cannot pass with both paths
+    reading the wrong records; and the order given is the order returned, with
+    duplicates legal (the end-of-data bracket ``[last, last]`` is one)."""
+    reader = NetCDFReader()
+    one = reader.read_native(
+        reader.open(cadence_blob), records={"dim": "time", "indices": [2]}
+    )
+    assert np.asarray(one["t2m"].data).ravel().tolist() == [
+        300.0, 301.0, 302.0, 310.0, 311.0, 312.0
+    ]
+    assert np.asarray(one["time"].data).tolist() == [2.0]
+
+    rev = reader.read_native(
+        reader.open(cadence_blob), records={"dim": "time", "indices": [3, 1]}
+    )
+    assert np.asarray(rev["t2m"].data)[:, 0, 0].tolist() == [400.0, 200.0]
+    assert np.asarray(rev["time"].data).tolist() == [3.0, 1.0]
+
+    dup = reader.read_native(
+        reader.open(cadence_blob), records={"dim": "time", "indices": [3, 3]}
+    )
+    assert np.asarray(dup["t2m"].data).shape == (2, 2, 3)
+    assert np.asarray(dup["t2m"].data)[:, 0, 0].tolist() == [400.0, 400.0]
+    assert np.asarray(dup["time"].data).tolist() == [3.0, 3.0]
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_records_compose_with_variables_and_select(cadence_blob):
+    """`variables`, `select` and `records` are three independent narrowings of
+    one decode and must compose: project, window, then records."""
+    reader = NetCDFReader()
+    got = reader.read_native(
+        reader.open(cadence_blob),
+        ["t2m"],
+        {"axes": ["all", {"indices": [1]}, {"slice": [0, 3, 2]}]},
+        records={"dim": "time", "indices": [2, 0]},
+    )
+    assert got.variable_names() == ["t2m"]
+    assert np.asarray(got["t2m"].data).shape == (2, 1, 2)
+    assert np.asarray(got["t2m"].data).ravel().tolist() == [310.0, 312.0, 110.0, 112.0]
+    assert np.asarray(got["time"].data).tolist() == [2.0, 0.0]
+    assert np.asarray(got["lat"].data).tolist() == [41.0]
+    assert np.asarray(got["lon"].data).tolist() == [-90.0, -88.0]
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_records_moves_no_boundary_the_select_refusal_drew(cadence_blob):
+    """A `select` whose time axis is not "all" is still REFUSED — `records` says
+    only that the reader may be TOLD records, never that it may choose them."""
+    reader = NetCDFReader()
+    with pytest.raises(ValueError, match="record selection is the Provider's"):
+        reader.read_native(
+            reader.open(cadence_blob), None, {"axes": [{"indices": [0]}, "all", "all"]}
+        )
+    with pytest.raises(ValueError, match="record selection is the Provider's"):
+        reader.read_native(
+            reader.open(cadence_blob),
+            None,
+            {"axes": [{"indices": [0]}, "all", "all"]},
+            records={"dim": "time", "indices": [0]},
+        )
+
+
+@pytest.mark.needs_format("netcdf")
+def test_netcdf_bad_records_is_an_error_not_a_wrapped_or_widened_read(cadence_blob):
+    """The reader is told the records and never the cadence: it does no `mod1`,
+    so an out-of-range index is an error, and an empty list is a caller bug
+    rather than a licence to read every record."""
+    reader = NetCDFReader()
+    for bad in ([4], [-1], [0, 9]):
+        with pytest.raises(IndexError, match="outside 0:3"):
+            reader.read_native(
+                reader.open(cadence_blob), records={"dim": "time", "indices": bad}
+            )
+    with pytest.raises(ValueError, match="which the blob does not have"):
+        reader.read_native(
+            reader.open(cadence_blob), records={"dim": "nope", "indices": [0]}
+        )
+    with pytest.raises(ValueError, match="empty selection is an error"):
+        reader.read_native(
+            reader.open(cadence_blob), records={"dim": "time", "indices": []}
+        )
+    with pytest.raises(ValueError, match='must be a mapping with "dim" and "indices"'):
+        reader.read_native(reader.open(cadence_blob), records={"dim": "time"})
+    with pytest.raises(ValueError, match="both narrow dimension"):
+        reader.read_native(
+            reader.open(cadence_blob),
+            None,
+            {"axes": ["all", {"indices": [0]}, "all"]},
+            records={"dim": "lat", "indices": [0]},
+        )
+    # The `len -> indices` CALLABLE is a Julia in-process convenience, not the
+    # wire form. Refused by name rather than dying inside `int()`, so a caller
+    # porting Julia code is told what the portable spelling is.
+    with pytest.raises(ValueError, match="must be a list of 0-based indices"):
+        reader.read_native(
+            reader.open(cadence_blob),
+            records={"dim": "time", "indices": lambda n: [n - 1]},
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,7 @@ from .registry import (
     Store,
     Transport,
     all_registries,
+    dim_length,
     format_registry,
     store_registry,
     supports_selection,
@@ -120,6 +121,7 @@ __all__ = [
     "store_registry",
     "all_registries",
     "supports_selection",
+    "dim_length",
     # cache core
     "Cache",
     "CacheEntry",

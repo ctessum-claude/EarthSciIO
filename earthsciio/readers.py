@@ -196,6 +196,74 @@ def _netcdf_dim_selection(ds: Any, select: Optional[Any]) -> Optional[Dict[str, 
     return out or None
 
 
+def _netcdf_merge_records(
+    ds: Any,
+    isel: Optional[Dict[str, List[int]]],
+    records: Optional[Any],
+) -> Optional[Dict[str, List[int]]]:
+    """Fold a ``records`` pushdown into the ``select``-derived dimension map.
+
+    The two vocabularies meet here on purpose: a record selection IS a one-axis
+    index list, so it rides the same ``.isel`` machinery a spatial window rides
+    and cannot decode differently from one. What differs is only WHO may ask —
+    hence the separate keyword and the explicit ``dim``. Mirrors the Julia
+    ``_netcdf_merge_records`` and the Rust ``merge_records`` exactly; the three
+    must not drift, because the same indices must name the same records in every
+    track (``spec/registries.md`` §2.1).
+    """
+    if records is None:
+        return isel
+    if not isinstance(records, dict) or "dim" not in records or "indices" not in records:
+        keys = sorted(map(str, records)) if isinstance(records, dict) else records
+        raise ValueError(
+            f'records must be a mapping with "dim" and "indices", got {keys!r}'
+        )
+    dim = str(records["dim"])
+    if dim not in ds.sizes:
+        raise ValueError(
+            f"records names dimension {dim!r}, which the blob does not have; "
+            f"present: {sorted(map(str, ds.sizes))}"
+        )
+    want = records["indices"]
+    if callable(want):
+        # The wire form is a LIST. Julia additionally resolves a `len -> indices`
+        # callable inside its own open, because the JULIA Provider pushes down on
+        # every sample and would otherwise pay a second open per tick. Nothing in
+        # this track does that (`Provider._file_for` says why, and
+        # `Provider._read_file` is where such a call would be made), so a callable
+        # here is a caller reaching for a spelling this track does not have — an
+        # error naming the portable form rather than a `TypeError` out of `int()`.
+        raise ValueError(
+            "records['indices'] must be a list of 0-based indices; the "
+            "`len -> indices` callable form is a Julia in-process convenience "
+            "and is not part of the wire contract. Read the length with "
+            "NetCDFReader.dim_length(path, dim) and pass the list"
+        )
+    idxs = [int(i) for i in want]
+    if not idxs:
+        raise ValueError(
+            f"records asks for no records of {dim!r}; an empty selection is an "
+            "error, not a whole-axis read"
+        )
+    length = int(ds.sizes[dim])
+    bad = sorted({i for i in idxs if i < 0 or i >= length})
+    if bad:
+        raise IndexError(
+            f"records index/indices {bad} are outside 0:{length - 1} for dimension "
+            f"{dim!r} (the reader does not wrap: locating a cadence tick inside "
+            "its file is the Provider's job)"
+        )
+    out = dict(isel) if isel else {}
+    if dim in out:
+        raise ValueError(
+            f"select and records both narrow dimension {dim!r}; a record "
+            'selection is the Provider\'s and a `select` must leave the record '
+            'axis "all"'
+        )
+    out[dim] = idxs
+    return out
+
+
 def _netcdf_window(da: Any, isel: Optional[Dict[str, List[int]]]) -> Any:
     """Apply the dimension selection to one ``DataArray`` (identity when empty).
 
@@ -226,6 +294,12 @@ class NetCDFReader:
     while ``store_backed`` stays absent/``False``, which is how a caller tells a
     decode-scoped selection from the zarr reader's fetch-scoped one. See
     :meth:`read_native` for the axis rules.
+
+    ``records`` is RECORD PUSHDOWN, the other half of the refused-time-axis rule:
+    a ``select`` refuses a time axis because record selection belongs to whoever
+    owns the cadence, and ``records`` is how that owner says which records it
+    wants. See :meth:`read_native` for its semantics and :meth:`dim_length` for
+    the metadata read that makes its indices computable out of process.
     """
 
     #: Registry name + format key(s) + extension sniff hints.
@@ -249,11 +323,33 @@ class NetCDFReader:
         :meth:`read_native` under a ``with`` block so nothing leaks."""
         return blob_path
 
+    def dim_length(self, path: Any, dim: str) -> Optional[int]:
+        """The length of dimension ``dim`` in the blob at ``path``, or ``None``.
+
+        Read from the file's METADATA — the header, never an array
+        (``spec/registries.md`` §2.3). ``None`` when the blob has no such
+        dimension; every other reader inherits "cannot answer" (see
+        :func:`earthsciio.registry.dim_length`).
+
+        This is the whole-file counterpart of the store-backed
+        :meth:`~earthsciio.backends.zarr.ZarrReader.array_shape`, and it is what
+        makes a ``records`` pushdown expressible **out of process**: the records a
+        cadence owner wants are a function of the file's length along the record
+        axis, so that length has to be knowable before the decode the selection is
+        meant to narrow.
+        """
+        import netCDF4  # lazy: only the netcdf path needs the heavy stack
+
+        with netCDF4.Dataset(str(path), "r") as ds:
+            d = ds.dimensions.get(str(dim))
+            return None if d is None else int(len(d))
+
     def read_native(
         self,
         handle: Any,
         variables: Optional[Sequence[str]] = None,
         select: Optional[Any] = None,
+        records: Optional[Any] = None,
         **_: Any,
     ) -> NativeDataset:
         """Decode ``handle`` into a :class:`NativeDataset`.
@@ -287,6 +383,21 @@ class NetCDFReader:
           length 1 — and an axis may legally select NOTHING (``{"indices": []}``,
           or an empty half-open ``{"slice": [1, 1]}``), giving a **zero-length
           axis** kept in ``dims`` rather than an error.
+
+        ``records = {"dim": <name>, "indices": [<0-based>, ...]}`` is RECORD
+        PUSHDOWN — the other half of the refused time axis above. The refusal says
+        the reader may not *choose* records, not that every record must be
+        decoded; ``records`` is the separate option through which the cadence
+        owner states the records it has already chosen, in the file's own
+        numbering. The reader is told the records and never the cadence: it does
+        no ``mod1``, knows nothing of the cadence grid or ``records_per_sample``,
+        and materialises exactly the named records of ``dim`` (and of ``dim``'s
+        own coordinate) **in the order given**. Duplicates are legal — the
+        end-of-data bracket ``[last, last]`` is one — while an index outside
+        ``0:len-1``, a ``dim`` the blob lacks, an empty list, or a ``select``
+        narrowing the same ``dim`` are all errors rather than a wrapped or
+        widened read. ``indices`` is a LIST (the wire form); use
+        :meth:`dim_length` to learn the axis length that determines it.
         """
         import xarray as xr  # lazy: only the netcdf path needs the heavy stack
 
@@ -303,6 +414,11 @@ class NetCDFReader:
                         f"present data variables: {sorted(map(str, ds.data_vars))}"
                     )
             isel = _netcdf_dim_selection(ds, select)
+            # RECORD PUSHDOWN: the cadence owner's chosen records of its own axis,
+            # folded into the same map. Without it the record axis comes back
+            # whole and the caller slices afterwards — every record decoded to
+            # keep one or two.
+            isel = _netcdf_merge_records(ds, isel, records)
             for name, da in ds.data_vars.items():
                 if want is not None and str(name) not in want:
                     continue

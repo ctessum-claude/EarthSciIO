@@ -224,6 +224,26 @@ def check_reader_options(reader: Any, loader: "DataSource") -> None:
     unknown = [k for k in options if k not in accepted]
     if unknown:
         raise UnknownReaderOption(loader.format, unknown, accepted)
+    # A DISCRETE loader makes the record axis the PROVIDER's: it resolves each
+    # cadence anchor to that file's own record (`_record_index`) and slices — or
+    # brackets — there. A `records` baked into `reader_kwargs` narrows the very
+    # same axis BEHIND that resolution, so the anchor is then located inside an
+    # already-narrowed axis: with a one-record `records` the file's time
+    # coordinate has a single value, every anchor resolves to record 0, and
+    # `records_per_sample = 2` degenerates to `[r, r]` — a constant field where
+    # the model expected to interpolate. No error anywhere, so it is refused
+    # here (`spec/registries.md` §2.1, the rule that makes an unrecognised
+    # option an error rather than an ignored key). `records = None` stays legal:
+    # it asks only for the whole record axis, which is what this track reads.
+    if loader.temporal is not None and options.get("records") is not None:
+        raise ValueError(
+            "reader option `records` may not be baked into a provider that owns "
+            f"a record axis (time_dim={loader.temporal.time_dim!r}): the Provider "
+            "resolves each cadence anchor to a file-local record, so a "
+            "caller-supplied `records` would narrow the axis the anchor is "
+            "located inside and every anchor would read the same record. Drop it "
+            "— or pass `records=None` to state the whole record axis explicitly"
+        )
 
 
 class Provider:
@@ -530,7 +550,25 @@ class Provider:
         file-period seam (two adjacent files) decodes each at most once.
 
         A per-call ``select`` override reads fresh and bypasses the decoded-file
-        LRU (the projected decode must not be cached as the plain buffer)."""
+        LRU (the projected decode must not be cached as the plain buffer).
+
+        **Why this Provider does not push its records into the decode.** The
+        netcdf reader honours a ``records`` option in every track
+        (``spec/registries.md`` §2.1) and the Julia Provider uses it, because that
+        one computes its record from the cadence and keeps no decoded-file buffer:
+        there, a whole-file decode per sample is pure waste. Here the buffer IS
+        the optimisation — one whole-file decode is amortised over every anchor in
+        the file — so pushing down would replace one decode per FILE with one per
+        TICK. Measured on this stack (xarray 2024.7.0 / netCDF4): an A1-shaped
+        file (24 records, 47 2-D variables) decodes whole in 30.0 ms, i.e. 1.25 ms
+        per tick, against 32.1 ms for a narrowed 2-record decode — 25.7x worse per
+        tick; an A3dyn-shaped file (8 records, 6 3-D variables) 26.5 ms whole =
+        3.3 ms per tick against 10.0 ms narrowed, 3.0x worse. Record location
+        would also need the file's own time axis first (:func:`_record_index`
+        matches it), i.e. a second read of what the pushdown was avoiding. A
+        caller that wants the narrowed decode can have it directly from the
+        reader; a track is not made slower for symmetry.
+        """
         if select is not None:
             return self._read_file(self.loader.resolve_url(file_anchor), select=select)
         ds = self._files.get(file_anchor)

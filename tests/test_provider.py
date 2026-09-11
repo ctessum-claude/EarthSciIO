@@ -407,6 +407,65 @@ def test_recognised_reader_options_are_the_reader_signature(cache):
     Provider(DataSource("openaq", "csv", OPENAQ_URL), cache)
 
 
+@pytest.mark.needs_format("netcdf")
+def test_records_is_a_declared_netcdf_option(cache):
+    """The `records` pushdown is a real decode option of THIS track's netcdf
+    reader (``spec/registries.json`` ``format.netcdf.reader_options``), not a
+    spec-only promise a Python caller discovers as a ``TypeError``."""
+    accepted = reader_option_names(format_registry.create("netcdf"))
+    assert {"select", "records"} <= accepted
+
+
+@pytest.mark.needs_format("netcdf")
+def test_baked_records_beside_a_cadence_is_refused_not_honoured(cache):
+    """Making `records` a declared option would otherwise let a caller bake one
+    into ``reader_kwargs`` beside a cadence, narrowing the record axis BEHIND the
+    Provider's own anchor→record resolution.
+
+    The Provider then locates the anchor inside an already-narrowed axis: with a
+    one-record `records` the file's time coordinate has a single value, every
+    anchor resolves to record 0, and ``refresh`` hands back the same record
+    forever — a constant field where the model expected to interpolate, with no
+    error anywhere. Refused at construction (``spec/registries.md`` §2.1); the
+    Julia track refuses the same shape for the same reason.
+    """
+    temporal = SourceTemporal(start=START, frequency=HOUR, file_period=2 * HOUR)
+    baked = {"dim": "time", "indices": [0]}
+    with pytest.raises(ValueError, match="`records` may not be baked"):
+        Provider(
+            DataSource("era5", "netcdf", ERA5_URL, temporal=temporal,
+                       reader_kwargs={"records": baked}),
+            cache,
+        )
+    # Left unrefused, that is what it would have done: every anchor the same
+    # record. Shown through the reader the Provider would have called, so the
+    # assertion pins the wrong NUMBER the refusal prevents rather than merely
+    # restating the rule.
+    reader = format_registry.create("netcdf")
+    blob = cache.fetch(ERA5_URL)
+    narrowed = reader.read_native(reader.open(blob.path), None, records=baked)
+    assert len(narrowed["time"].data) == 1  # ...so `mod1(anchor, 1)` is always 0
+    whole = reader.read_native(reader.open(blob.path))
+    assert len(whole["time"].data) == 2
+    p = Provider(DataSource("era5", "netcdf", ERA5_URL, temporal=temporal), cache)
+    assert p.refresh(_utc(0))["t2m"].data[0, 0] != pytest.approx(
+        p.refresh(_utc(1))["t2m"].data[0, 0]
+    )
+
+    # `records = None` stays legal — it states the whole record axis, which is
+    # what this track reads — and so does a `records` on a CONST loader, which
+    # owns no cadence and therefore no record axis to narrow behind.
+    Provider(
+        DataSource("era5", "netcdf", ERA5_URL, temporal=temporal,
+                   reader_kwargs={"records": None}),
+        cache,
+    )
+    const = Provider(
+        DataSource("era5", "netcdf", ERA5_URL, reader_kwargs={"records": baked}), cache
+    )
+    assert len(const.materialize()["time"].data) == 1
+
+
 def test_a_store_backed_reader_declares_its_options_on_read_store():
     """A store-backed reader's decode entry point is ``read_store``, so that is
     the signature the check reads (the zarr reader takes only ``select``)."""

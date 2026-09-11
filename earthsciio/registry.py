@@ -59,7 +59,29 @@ __all__ = [
     "store_registry",
     "all_registries",
     "supports_selection",
+    "dim_length",
 ]
+
+
+def dim_length(reader: Any, path: Any, dim: str) -> Optional[int]:
+    """The length of dimension ``dim`` in the blob at ``path``, or ``None``.
+
+    Read from the blob's METADATA — the header, never an array
+    (``spec/registries.md`` §2.3). ``None`` when the reader cannot answer (the
+    default every reader inherits) or when the blob has no such dimension; a
+    caller must treat that as "read whole and slice on my own side" rather than
+    as an error.
+
+    This is the whole-file counterpart of the store-backed ``array_shape``, and it
+    is what makes a ``records`` pushdown (``conformance.md``, "NetCDF decode
+    notes") expressible out of process: the records a cadence owner wants are a
+    function of the file's length along the record axis, so that length has to be
+    known before the decode the selection is meant to narrow. The Python
+    realization of the Julia ``dim_length`` generic and the Rust
+    ``Reader::dim_length``.
+    """
+    fn = getattr(reader, "dim_length", None)
+    return None if fn is None else fn(path, dim)
 
 
 def supports_selection(reader: Any) -> bool:
