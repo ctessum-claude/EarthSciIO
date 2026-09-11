@@ -511,8 +511,7 @@ def read_geotiff(path, expected):
 
 READERS = {"netcdf": read_netcdf, "csv": read_csv, "ff10": read_ff10,
            "zarr": read_zarr, "shapefile": read_shapefile,
-           "parquet": read_parquet}
-           "geotiff": read_geotiff}
+           "parquet": read_parquet, "geotiff": read_geotiff}
 
 
 def _verify_zarr_objects(case) -> list:

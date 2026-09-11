@@ -429,3 +429,38 @@ fn flatten_str(v: &Value) -> Vec<String> {
     rec(v, &mut out);
     out
 }
+
+/// A `variables` projection that names something the blob does not hold is an
+/// ERROR listing what is present — not a quietly missing array.
+///
+/// The other two tracks (and this track's `parquet`/`shapefile` readers) have
+/// always said so; the `netcdf` reader used to filter with a set membership test
+/// and simply return fewer fields, so a typo'd `file_variable` surfaced far from
+/// its cause as a `KeyError` in the consumer.
+#[test]
+fn netcdf_projection_rejects_an_absent_variable_and_keeps_coords() {
+    let corpus = corpus_dir();
+    let case: Value =
+        serde_json::from_slice(&fs::read(corpus.join("cases/era5-grid-sub-tile.json")).unwrap())
+            .unwrap();
+    let blob = corpus.join(case["blob_path"].as_str().unwrap());
+    let reader = FormatRegistry::with_builtins().get("netcdf").unwrap();
+
+    // The projection itself: only `t2m`, with every coordinate still returned.
+    let one = reader
+        .read_native(&blob, &["t2m".to_string()], &Selection::All)
+        .expect("projected decode");
+    let mut names: Vec<&str> = one.variables.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["t2m"]);
+    assert!(one.coords.contains_key("latitude"));
+    assert!(one.coords.contains_key("longitude"));
+    assert!(one.coords.contains_key("time"));
+
+    let err = reader
+        .read_native(&blob, &["t2m".to_string(), "nope".to_string()], &Selection::All)
+        .expect_err("an absent variable must be an error");
+    let msg = err.to_string();
+    assert!(msg.contains("nope"), "error must name the absent variable: {msg}");
+    assert!(msg.contains("sp"), "error must list what IS present: {msg}");
+}

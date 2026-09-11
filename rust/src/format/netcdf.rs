@@ -23,7 +23,10 @@
 //!   integer fill sentinel cannot be `NaN`, so it survives and is reported via
 //!   `fill_value`;
 //! - a **coordinate variable** (name == a dimension) is always returned, on the
-//!   native grid, carrying its `units`/`calendar` verbatim.
+//!   native grid, carrying its `units`/`calendar` verbatim;
+//! - a **text** variable (`char`, or a NetCDF-4 `NC_STRING`) is a `string` field,
+//!   under the classic character-array convention spelled out on
+//!   [`stacks_last_dimension`].
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -68,9 +71,38 @@ impl Reader for NetcdfReader {
 
 /// Decode an opened NetCDF file into native arrays, honoring the `variables`
 /// filter (empty = all data variables; coordinate variables are always kept).
+///
+/// A requested name absent from the blob is an error listing what is present —
+/// the rule the `parquet`/`shapefile` readers and the Python/Julia netcdf
+/// readers already follow, so a typo'd `file_variable` cannot read back as a
+/// silently missing array in this track alone.
 fn decode(file: &NcFile, variables: &[String]) -> Result<NativeDataset> {
     let vars: Vec<NcVariable> = file.variables().map_err(fmt_err)?.to_vec();
     let want: HashSet<&str> = variables.iter().map(String::as_str).collect();
+
+    if !want.is_empty() {
+        let mut present: Vec<&str> = vars
+            .iter()
+            .filter(|v| !v.is_coordinate_variable())
+            .map(NcVariable::name)
+            .collect();
+        present.sort_unstable();
+        let mut missing: Vec<&str> = want
+            .iter()
+            .copied()
+            .filter(|n| !present.contains(n))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            return Err(Error::Format {
+                format: "netcdf".to_string(),
+                detail: format!(
+                    "requested variables not in blob: {missing:?}; \
+                     present data variables: {present:?}"
+                ),
+            });
+        }
+    }
 
     let mut out = NativeDataset::default();
     for var in &vars {
@@ -80,10 +112,37 @@ fn decode(file: &NcFile, variables: &[String]) -> Result<NativeDataset> {
         if !is_coord && !want.is_empty() && !want.contains(var.name()) {
             continue;
         }
-        // Only numeric variables become native fields; text/opaque/compound/…
-        // variables (e.g. an ERA5 `expver` string) carry no array and are skipped.
-        let Some(class) = classify(var) else { continue };
-        let field = decode_field(file, var, class)?;
+        // A TEXT variable — a `char` array (an ERA5 `expver`, a `char label(n)`)
+        // or a NetCDF-4 `NC_STRING` — is a `string` field here, exactly as the
+        // Python (xarray) and Julia (NCDatasets) tracks return one. This reader
+        // used to skip it, which made the same bytes decode to a different SET of
+        // fields in each track; a variable one track drops is not a permitted
+        // divergence, so it is decoded, not skipped.
+        //
+        // What is left over is the genuinely unreadable: a compound/opaque/enum/
+        // vlen variable, which has no array reading in ANY track. Skipping one the
+        // document EXPLICITLY NAMED would hand back a dataset missing an array it
+        // asked for — the "silently missing array" the absent-name check above
+        // exists to prevent, reached by the other door, since such a variable IS
+        // present and so passes that check. So it is an error naming its type;
+        // unrequested, it is simply not a native field. (Verbatim the `parquet`
+        // reader's rule for a column with no rank-1 reading.)
+        let Some(class) = classify(var) else {
+            if want.contains(var.name()) {
+                return Err(Error::Format {
+                    format: "netcdf".to_string(),
+                    detail: format!(
+                        "requested variable {:?} has netcdf type {:?}, which has no \
+                         native array reading (compound/opaque/enum/vlen variables \
+                         are not decoded)",
+                        var.name(),
+                        var.dtype()
+                    ),
+                });
+            }
+            continue;
+        };
+        let field = decode_field(file, &vars, var, class)?;
 
         if is_coord {
             out.coords.insert(
@@ -110,10 +169,19 @@ enum FieldClass {
     Int32,
     /// `int64`: a wide unpacked integer; an integer fill sentinel survives.
     Int64,
+    /// `string`: a `char` array, or a NetCDF-4 `NC_STRING`.
+    Text,
 }
 
-/// Classify a variable, or `None` if it is not a numeric native field.
+/// Classify a variable, or `None` if it has no native array reading in ANY
+/// track (a compound/opaque/enum/vlen variable).
 fn classify(var: &NcVariable) -> Option<FieldClass> {
+    // Text is matched FIRST. A `char` variable is never CF-packed, and a stray
+    // `add_offset`/`scale_factor` attribute on one would otherwise route its
+    // bytes into the float reader, which cannot read them.
+    if matches!(var.dtype(), NcType::Char | NcType::String) {
+        return Some(FieldClass::Text);
+    }
     // Packing forces float64 regardless of the on-disk integer width.
     if var.attribute("scale_factor").is_some() || var.attribute("add_offset").is_some() {
         return Some(FieldClass::Float);
@@ -128,13 +196,61 @@ fn classify(var: &NcVariable) -> Option<FieldClass> {
     }
 }
 
-/// Decode one variable's values into a [`NativeField`] under `class`.
-fn decode_field(file: &NcFile, var: &NcVariable, class: FieldClass) -> Result<NativeField> {
+/// Does `var`'s LAST dimension measure a **string length** rather than count
+/// elements? This is the classic-NetCDF character-array convention, and it is a
+/// property of the whole file, not of the variable in isolation.
+///
+/// In classic NetCDF a "string" is conventionally a `char` array whose last
+/// dimension is the string length: `char label(n, strlen)` is `n` strings of up
+/// to `strlen` bytes, NUL-padded — **not** `n * strlen` single characters. But
+/// the very same spelling `char label(n)` next to a `float value(n)` is `n`
+/// one-byte strings, because there `n` is a real axis a numeric variable lives
+/// on. The dimension name alone cannot tell the two apart.
+///
+/// So the last dimension is a string length exactly when **nothing else claims
+/// it as an axis** — which is the rule xarray applies (`conventions.stackable`,
+/// gating `CharacterArrayCoder`) and therefore the rule the Python track already
+/// produces for these bytes:
+///
+/// - the dimension has no coordinate variable of its own, and
+/// - every variable that uses it is a `char` variable that uses it LAST.
+///
+/// Two consequences, both verified against xarray in this module's tests:
+/// a 1-D `char label(strlen)` on a dimension nothing else uses is a **scalar**
+/// string (`dims == []`, one value); a `char label(n)` sharing `n` with a
+/// numeric variable stays `n` one-character strings on `dims == ["n"]`.
+fn stacks_last_dimension(vars: &[NcVariable], var: &NcVariable) -> bool {
+    let var_dims = var.dimensions();
+    let Some(last) = var_dims.last().map(|d| d.name.as_str()) else {
+        // A scalar `char` is one one-byte string under either reading.
+        return false;
+    };
+    // A dimension carrying a coordinate variable is an axis, never a length.
+    if vars.iter().any(|v| v.name() == last) {
+        return false;
+    }
+    vars.iter().all(|v| {
+        let dims = v.dimensions();
+        !dims.iter().any(|d| d.name == last)
+            || (matches!(v.dtype(), NcType::Char)
+                && dims.last().map(|d| d.name.as_str()) == Some(last))
+    })
+}
+
+/// Decode one variable's values into a [`NativeField`] under `class`. `vars` is
+/// every variable in the file — [`stacks_last_dimension`] needs the whole set.
+fn decode_field(
+    file: &NcFile,
+    vars: &[NcVariable],
+    var: &NcVariable,
+    class: FieldClass,
+) -> Result<NativeField> {
     let dims: Vec<String> = var.dimensions().iter().map(|d| d.name.clone()).collect();
     let shape: Vec<usize> = var.dimensions().iter().map(|d| d.size as usize).collect();
     let name = var.name();
 
     match class {
+        FieldClass::Text => decode_text_field(file, vars, var, dims, shape),
         FieldClass::Float => {
             // scale_factor/add_offset applied in double; _FillValue/missing_value
             // folded to NaN. Values are row-major (C order) per `shape`.
@@ -170,6 +286,112 @@ fn decode_field(file: &NcFile, var: &NcVariable, class: FieldClass) -> Result<Na
     }
 }
 
+/// Decode a `char`/`NC_STRING` variable into a `string` [`NativeField`].
+///
+/// Three shapes, all of them what the Python (xarray) track returns for the same
+/// bytes — this module's tests pin the values against it:
+///
+/// - **`NC_STRING`** (NetCDF-4 only): already one string per element. `dims` and
+///   `shape` are the variable's own.
+/// - **`char` whose last dimension is a string length**
+///   ([`stacks_last_dimension`]): that dimension is consumed, so `dims`/`shape`
+///   lose their last entry — `char label(n, strlen)` is `n` strings, and a 1-D
+///   `char label(strlen)` is a scalar string on `dims == []`.
+/// - **`char` whose last dimension is a real axis**: one one-character string
+///   per byte, `dims`/`shape` unchanged.
+///
+/// Trailing NUL padding is stripped from every string, and only trailing NULs —
+/// a trailing SPACE is data. That is `netcdf-reader`'s `decode_char_string` and
+/// it is byte-for-byte numpy's `|S` semantics, which is what makes the Python
+/// track agree: a lone NUL byte decodes to the EMPTY string, as numpy's `|S1`
+/// does, not to a `"\0"`.
+fn decode_text_field(
+    file: &NcFile,
+    vars: &[NcVariable],
+    var: &NcVariable,
+    mut dims: Vec<String>,
+    mut shape: Vec<usize>,
+) -> Result<NativeField> {
+    let name = var.name();
+    // Both backends flatten a char array by its last dimension and NUL-strip each
+    // group; for an `NC_STRING` each element is already its own string.
+    let groups = file.read_variable_as_strings(name).map_err(fmt_err)?;
+
+    let values = if matches!(var.dtype(), NcType::String) {
+        groups
+    } else if stacks_last_dimension(vars, var) {
+        // The last dimension was the string length: drop it from the logical
+        // shape. `netcdf-reader` grouped by exactly that dimension already.
+        dims.pop();
+        shape.pop();
+        groups
+    } else {
+        // A real axis: every byte is its own one-character string. Rebuild that
+        // from the grouped read — the group is NUL-stripped only at its END, so
+        // the characters it dropped are exactly the trailing cells, and each of
+        // those is the empty string (numpy `|S1` of a NUL byte is `b""`).
+        let group_len = if shape.len() >= 2 {
+            shape[shape.len() - 1]
+        } else {
+            shape.iter().product::<usize>().max(1)
+        };
+        let mut out: Vec<String> = Vec::with_capacity(group_len * groups.len());
+        for group in &groups {
+            let mut n = 0usize;
+            for ch in group.chars() {
+                // A NUL byte is an EMPTY cell, never a `"\0"` — numpy's `|S1`
+                // strips trailing NULs from each one-byte cell, so an interior
+                // NUL in the run reads back as `b""`. Only trailing NULs of the
+                // whole run were already dropped above; these are the rest.
+                out.push(if ch == '\0' {
+                    String::new()
+                } else {
+                    ch.to_string()
+                });
+                n += 1;
+            }
+            if n > group_len {
+                // Only reachable for genuinely multi-byte text, where "one cell
+                // per byte" and "one cell per character" disagree. Refuse rather
+                // than hand back a differently-sized array than Python's.
+                return Err(Error::Format {
+                    format: "netcdf".to_string(),
+                    detail: format!(
+                        "char variable {name:?} is not one byte per character \
+                         ({n} characters in a {group_len}-cell run); a non-ASCII \
+                         char array on a shared dimension has no single native \
+                         reading"
+                    ),
+                });
+            }
+            for _ in n..group_len {
+                out.push(String::new());
+            }
+        }
+        out
+    };
+
+    let expected: usize = shape.iter().product();
+    if values.len() != expected {
+        return Err(Error::Format {
+            format: "netcdf".to_string(),
+            detail: format!(
+                "text variable {name:?} decoded to {} strings, but its shape \
+                 {shape:?} holds {expected}",
+                values.len()
+            ),
+        });
+    }
+
+    Ok(NativeField {
+        dtype: DType::Str,
+        dims,
+        shape,
+        data: ArrayData::Str(values),
+        fill_value: None,
+    })
+}
+
 /// A surviving integer fill sentinel (`_FillValue`, else `missing_value`).
 fn int_fill(var: &NcVariable) -> Option<f64> {
     att_f64(var, "_FillValue").or_else(|| att_f64(var, "missing_value"))
@@ -201,10 +423,193 @@ mod tests {
     /// Decode an in-memory blob by staging it to a temp file (the reader opens a
     /// path). Returns the decode result for assertion.
     fn read_bytes(bytes: &[u8]) -> Result<NativeDataset> {
+        read_bytes_projected(bytes, &[])
+    }
+
+    /// As [`read_bytes`], with a `variables` projection.
+    fn read_bytes_projected(bytes: &[u8], variables: &[String]) -> Result<NativeDataset> {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
-        NetcdfReader::new().read_native(f.path(), &[], &Selection::All)
+        NetcdfReader::new().read_native(f.path(), variables, &Selection::All)
+    }
+
+    /// The `label` field of a decode, as `(dims, shape, strings)`.
+    fn label_of(ds: &NativeDataset) -> (Vec<String>, Vec<usize>, Vec<String>) {
+        let f = ds.variables.get("label").expect("a `label` field");
+        assert_eq!(f.dtype, DType::Str, "a text variable is a `string` field");
+        let ArrayData::Str(vals) = &f.data else {
+            panic!(
+                "a text variable must carry ArrayData::Str, got {:?}",
+                f.data
+            )
+        };
+        (f.dims.clone(), f.shape.clone(), vals.clone())
+    }
+
+    /// A minimal CDF-1 classic file: dim `n=3`, `float value(n) = [1,2,3]` and
+    /// `char label(n) = "abc"`. `n` is a real axis (`value` lives on it), so
+    /// `label` is THREE one-character strings, not one string `"abc"`.
+    const CHAR_VAR_CDF1: &[u8] = b"\
+        \x43\x44\x46\x01\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x01\
+        \x00\x00\x00\x01\x6e\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\x02\x00\x00\x00\x05\
+        \x76\x61\x6c\x75\x65\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x0c\
+        \x00\x00\x00\x7c\x00\x00\x00\x05\x6c\x61\x62\x65\x6c\x00\x00\x00\
+        \x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+        \x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x88\x3f\x80\x00\x00\
+        \x40\x00\x00\x00\x40\x40\x00\x00\x61\x62\x63\x00";
+
+    /// The same 176-byte CDF-1 file with dims `n=4` and a PRIVATE `strlen=4`:
+    /// `float value(n)` and `char label(n, strlen)` holding, NUL-padded, the four
+    /// rows `"ab"`, `"cd  "`, `"efgh"`, `""`. Nothing but `label` uses `strlen`,
+    /// so `strlen` is the string length: four strings on `dims == ["n"]`.
+    const STRING_ROWS_CDF1: &[u8] = b"\
+        \x43\x44\x46\x01\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x02\
+        \x00\x00\x00\x01\x6e\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x06\
+        \x73\x74\x72\x6c\x65\x6e\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\x02\x00\x00\x00\x05\
+        \x76\x61\x6c\x75\x65\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x10\
+        \x00\x00\x00\x90\x00\x00\x00\x05\x6c\x61\x62\x65\x6c\x00\x00\x00\
+        \x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x10\x00\x00\x00\xa0\
+        \x3f\x80\x00\x00\x40\x00\x00\x00\x40\x40\x00\x00\x40\x80\x00\x00\
+        \x61\x62\x00\x00\x63\x64\x20\x20\x65\x66\x67\x68\x00\x00\x00\x00";
+
+    /// A 160-byte CDF-1 file whose `char label(strlen)` is ONE-dimensional on a
+    /// private `strlen=5`, holding `"hi"` NUL-padded. The single dimension is the
+    /// string length, so the field is a SCALAR string: `dims == []`.
+    const SCALAR_STRING_CDF1: &[u8] = b"\
+        \x43\x44\x46\x01\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x02\
+        \x00\x00\x00\x01\x6e\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x06\
+        \x73\x74\x72\x6c\x65\x6e\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\x02\x00\x00\x00\x05\
+        \x76\x61\x6c\x75\x65\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x0c\
+        \x00\x00\x00\x8c\x00\x00\x00\x05\x6c\x61\x62\x65\x6c\x00\x00\x00\
+        \x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\
+        \x00\x00\x00\x02\x00\x00\x00\x08\x00\x00\x00\x98\x3f\x80\x00\x00\
+        \x40\x00\x00\x00\x40\x40\x00\x00\x68\x69\x00\x00\x00\x00\x00\x00";
+
+    /// [`CHAR_VAR_CDF1`] with an INTERIOR NUL: `char label(n) = "a\0c"` beside
+    /// `float value(n)`. Pins that a NUL cell is the empty string, not `"\0"`.
+    const CHAR_HOLES_CDF1: &[u8] = b"\
+        \x43\x44\x46\x01\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x01\
+        \x00\x00\x00\x01\x6e\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\x02\x00\x00\x00\x05\
+        \x76\x61\x6c\x75\x65\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\
+        \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x0c\
+        \x00\x00\x00\x7c\x00\x00\x00\x05\x6c\x61\x62\x65\x6c\x00\x00\x00\
+        \x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+        \x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x88\x3f\x80\x00\x00\
+        \x40\x00\x00\x00\x40\x40\x00\x00\x61\x00\x63\x00";
+
+    /// A `char` variable whose last dimension is a REAL AXIS — `n`, which
+    /// `float value(n)` also lives on — is one one-character string per cell, on
+    /// the variable's own `dims`/`shape`. It is NOT one string `"abc"`: `n`
+    /// counts elements here, it does not measure a length.
+    ///
+    /// Cross-track ground truth (`xr.open_dataset(decode_times=False,
+    /// mask_and_scale=True)` on these exact bytes, run against xarray 2024.7.0):
+    /// `label` is `dims=('n',) shape=(3,) dtype=|S1` with values
+    /// `[b'a', b'b', b'c']` — three cells, matching the three below.
+    #[test]
+    fn a_char_variable_on_a_shared_axis_is_one_string_per_cell() {
+        let all = read_bytes(CHAR_VAR_CDF1).expect("plain decode");
+        let (dims, shape, vals) = label_of(&all);
+        assert_eq!(dims, ["n"]);
+        assert_eq!(shape, [3]);
+        assert_eq!(vals, ["a", "b", "c"]);
+    }
+
+    /// A NUL cell in such a variable is the EMPTY string — numpy renders a `|S1`
+    /// NUL byte as `b""`, so `"a\0c"` is `["a", "", "c"]` and never `["a","\0","c"]`.
+    /// Ground truth: xarray gives `[b'a', b'', b'c']` for these bytes.
+    #[test]
+    fn a_nul_cell_in_a_char_axis_is_the_empty_string() {
+        let all = read_bytes(CHAR_HOLES_CDF1).expect("plain decode");
+        let (dims, shape, vals) = label_of(&all);
+        assert_eq!(dims, ["n"]);
+        assert_eq!(shape, [3]);
+        assert_eq!(vals, ["a", "", "c"]);
+    }
+
+    /// A `char label(n, strlen)` on a PRIVATE `strlen` is `n` strings of up to
+    /// `strlen` bytes, NUL-padded — never `n * strlen` single characters. The
+    /// length dimension is consumed, so `dims == ["n"]` and `shape == [4]`.
+    ///
+    /// Padding: trailing NULs are stripped and trailing SPACES are not (a space
+    /// is data), so `"cd  "` survives whole while `"ab\0\0"` is `"ab"` and an
+    /// all-NUL row is `""`. Ground truth: xarray gives
+    /// `dims=('n',) shape=(4,) dtype=|S4` with `[b'ab', b'cd  ', b'efgh', b'']`.
+    #[test]
+    fn a_private_last_dimension_is_the_string_length_not_an_axis() {
+        let all = read_bytes(STRING_ROWS_CDF1).expect("plain decode");
+        let (dims, shape, vals) = label_of(&all);
+        assert_eq!(dims, ["n"], "the strlen dimension is consumed");
+        assert_eq!(shape, [4]);
+        assert_eq!(vals, ["ab", "cd  ", "efgh", ""]);
+    }
+
+    /// The 1-D case of the same rule: a `char label(strlen)` whose only dimension
+    /// is a private length is ONE string, and therefore a SCALAR field — `dims`
+    /// and `shape` are both empty, exactly as xarray reports `dims=() shape=()
+    /// dtype=|S5` holding `b'hi'` for these bytes.
+    #[test]
+    fn a_one_dimensional_char_on_a_private_dimension_is_a_scalar_string() {
+        let all = read_bytes(SCALAR_STRING_CDF1).expect("plain decode");
+        let (dims, shape, vals) = label_of(&all);
+        assert!(dims.is_empty(), "a scalar string has no dims, got {dims:?}");
+        assert!(
+            shape.is_empty(),
+            "a scalar string has no shape, got {shape:?}"
+        );
+        assert_eq!(vals, ["hi"]);
+    }
+
+    /// Read-everything mode RETURNS the text variable rather than skipping it —
+    /// the whole point of the change. A reader that dropped it handed back a
+    /// different set of fields from the Python and Julia tracks for the same
+    /// bytes, which is a divergence, not a gap.
+    #[test]
+    fn read_everything_returns_the_text_variable_alongside_the_numeric_one() {
+        for blob in [CHAR_VAR_CDF1, STRING_ROWS_CDF1, SCALAR_STRING_CDF1] {
+            let all = read_bytes(blob).expect("plain decode");
+            let mut names: Vec<&str> = all.variables.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["label", "value"], "read-everything must keep both");
+        }
+    }
+
+    /// ...and the projection reaches it: naming the text variable projects to it
+    /// (it is no longer an error), naming the numeric one still excludes it, and
+    /// a name absent from the blob is still the error listing what is present.
+    #[test]
+    fn the_projection_selects_a_text_variable_like_any_other() {
+        let one = read_bytes_projected(STRING_ROWS_CDF1, &["label".to_string()])
+            .expect("a requested text variable now decodes");
+        assert_eq!(one.variables.keys().collect::<Vec<_>>(), ["label"]);
+        assert_eq!(label_of(&one).2, ["ab", "cd  ", "efgh", ""]);
+
+        let other = read_bytes_projected(STRING_ROWS_CDF1, &["value".to_string()])
+            .expect("projected decode");
+        assert_eq!(other.variables.keys().collect::<Vec<_>>(), ["value"]);
+
+        // The absent-name rule is untouched: a name that is NOT in the blob is
+        // still an error listing what is.
+        let err = read_bytes_projected(STRING_ROWS_CDF1, &["nope".to_string()])
+            .expect_err("an absent name must still be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nope"),
+            "error must name the absent one: {msg}"
+        );
+        assert!(
+            msg.contains("label"),
+            "error must list what IS present: {msg}"
+        );
     }
 
     #[test]

@@ -160,6 +160,61 @@ end
     end
 end
 
+@testset "netcdf reader — `variables` projection pushdown" begin
+    era5_case = JSON.parsefile(joinpath(CORPUS, "cases", "era5-grid-sub-tile.json"))
+    blob = joinpath(CORPUS, era5_case["blob_path"])
+    reader = FORMAT_REGISTRY["netcdf"]
+
+    full = read_native(reader, blob)
+    @test Set(variable_names(full)) == Set(["t2m", "sp"])
+
+    # The projection is field-for-field identical to decode-then-select — the
+    # acceptance gate: a pushed-down read may be cheaper, never different.
+    one = read_native(reader, blob; variables = ["t2m"])
+    @test variable_names(one) == ["t2m"]
+    # `isequal`, not `==`: t2m carries a masked cell decoded to NaN, and
+    # NaN != NaN would make an identical array compare unequal.
+    @test isequal(one["t2m"].data, full["t2m"].data)
+    @test one["t2m"].dims == full["t2m"].dims
+    @test one["t2m"].attrs == full["t2m"].attrs
+    # coords are ALWAYS kept (they are the grid the array lives on), attrs and all
+    @test coord_names(one) == coord_names(full)
+    for c in coord_names(full)
+        @test isequal(one[c].data, full[c].data)
+        @test one[c].dims == full[c].dims
+        @test one[c].attrs == full[c].attrs
+    end
+
+    # An EMPTY list reads every variable, NOT none (spec/conformance.md §3).
+    @test variable_names(read_native(reader, blob; variables = String[])) ==
+          variable_names(full)
+    @test variable_names(read_native(reader, blob; variables = nothing)) ==
+          variable_names(full)
+
+    # An absent name is an error naming what IS present, never a missing array.
+    err = try
+        read_native(reader, blob; variables = ["t2m", "nope"])
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("nope", sprint(showerror, err))
+    @test occursin("sp", sprint(showerror, err))
+
+    # Declaring the keyword is what makes the Provider push it down: the option
+    # set is READ OFF the method, and `_load` only merges `variables` into the
+    # reader call when the reader declares it.
+    @test :variables in reader_option_keys(reader)
+    cache = Cache(LocalStore(joinpath(CORPUS, "cache")); offline = true, verify = true)
+    p = const_provider(cache, era5_case["resolved_url"];
+                       format = "netcdf", variables = ["t2m"])
+    pushed = materialize(p)
+    @test variable_names(pushed) == ["t2m"]
+    @test isequal(pushed["t2m"].data, full["t2m"].data)
+    @test coord_names(pushed) == coord_names(full)
+end
+
 @testset "reader edge cases" begin
     # zarr is now active + store-backed: read_store requires an explicit variable
     # list (the store cannot be enumerated without a consolidated .zmetadata).

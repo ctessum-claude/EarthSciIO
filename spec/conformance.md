@@ -94,7 +94,48 @@ Every reader MUST decode identically, or cross-language equality fails. Pinned:
   to wall-clock instants is **ESS's** job, not the reader's.
 - **Variable identity** — arrays are keyed by the **on-disk `file_variable`**
   name. No remap, no `unit_conversion` (Risk R3 — those stay in ESS).
+- **Projection (`variables`)** — a loader's `variables` are pushed INTO the
+  reader wherever the format can honour them (`parquet` column chunks;
+  `netcdf`, where an unrequested variable is simply never decoded — a GEOS-FP A1
+  file carries 47 and a loader wants one), rather than being applied to an
+  already-decoded dataset. **Coordinates are always returned**; an **empty** list
+  means every data variable, never none; a requested name absent from the blob is
+  an error listing what is present, never a silently missing array. A reader with
+  no such option keeps the read-everything-then-select path, which must produce
+  the identical result. **"Never a silently missing array" covers a name that is
+  present but has no native array reading too** — a Parquet nested/binary column:
+  unrequested it is simply not a field, but *requested* it is an error naming the
+  type, because the document named an array it would not get. **A variable one
+  track cannot decode is not in that category** — it is a divergence, and it is
+  fixed by teaching the reader, not by documenting the gap.
 - **Strings** — text columns (CSV/JSON) are returned as `string` arrays verbatim.
+- **NetCDF text variables are `string` fields in every track.** A `char` variable
+  (an ERA5 `expver`, a `char label(n)`) or a NetCDF-4 `NC_STRING` is decoded and
+  returned like any other field — read-everything returns it, and the projection
+  may name it. No track may skip it: the same bytes must yield the same set of
+  fields everywhere. The classic character-array convention decides its shape,
+  and the convention is about the file, not the variable:
+  - A `char` variable's **last dimension is the string length** exactly when
+    nothing else claims it as an axis — the dimension has no coordinate variable
+    of its own, **and** every variable using it is a `char` variable using it
+    last. That dimension is then consumed: `char label(n, strlen)` is `n`
+    strings of up to `strlen` bytes, **not** `n × strlen` single characters, and
+    a 1-D `char label(strlen)` on a private dimension is a **scalar** string
+    (`dims == []`).
+  - Otherwise the last dimension is a real axis and every cell is its own
+    one-character string, on the variable's own `dims`/`shape`: `char label(n)`
+    beside a `float value(n)` is `n` one-character strings.
+  - **Trailing NUL padding is stripped; trailing spaces are data.** A cell that
+    is all NULs is the **empty string**, never `"\0"`.
+  - An `NC_STRING` is already one string per element; `dims`/`shape` are the
+    variable's own.
+
+  This is what xarray produces (its `CharacterArrayCoder`, gated on
+  `conventions.stackable`), which makes the Python track the reference for these
+  bytes. **Julia (NCDatasets) does not yet follow it** — it returns a raw `Char`
+  array of the full on-disk shape, so a 2-D `char` variable comes back as an
+  `n × strlen` matrix rather than `n` strings. That is an open divergence, not a
+  sanctioned one.
 - **FF10 zip member selection** — an `ff10` blob may be a `.zip`; the reader's
   `member` (singular), `members` (explicit list), and `member_glob`
   (fnmatch-style `*`/`?`/`[...]`, case-sensitive, matched against the full
@@ -213,7 +254,10 @@ that deviates is wrong rather than merely different:
 - **Nested and binary columns have no rank-1 reading.** `List`/`Struct`/`Map`/
   `Union`/`Binary` naming: requesting one in `variables` is an **error** (the
   document named an array it would not get); unrequested, it is simply not a
-  native field, as the NetCDF reader skips its non-numeric variables.
+  native field. The NetCDF reader applies the same rule to what is genuinely
+  unreadable there — a compound/opaque/enum/vlen variable. Its `char` and
+  `NC_STRING` variables are **not** in that set: they decode to `string` fields
+  (§3, "NetCDF text variables are `string` fields in every track").
 - **A zero-row file is TYPED, not absent.** The schema lives in the footer, so
   every column comes back empty with its declared dtype. This matters: most of a
   MOVES fixture's ~770 tables are empty, and a document binding one must still

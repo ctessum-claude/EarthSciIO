@@ -81,7 +81,14 @@ maps `_FillValue`/`missing_value` cells to `NaN`, and returns the time axis
 
 NCDatasets exposes arrays in column-major (reversed) dimension order; this
 reader permutes each array back to **file order** so `field.dims` and
-`size(field.data)` match the on-disk layout (and the Python/xarray track)."""
+`size(field.data)` match the on-disk layout (and the Python/xarray track).
+
+`reader_kwargs`: `variables=[...]` restricts the returned **data variables** and
+is a real PROJECTION PUSHDOWN — an unrequested variable is never decoded, rather
+than decoded and thrown away. Coordinate fields are always returned (they are the
+native grid the arrays live on). An empty list, like `nothing`, means **every**
+data variable (spec/conformance.md §3), never none; a requested name absent from
+the blob is an error listing what is present."""
 struct NetCDFReader <: Reader end
 
 # A CF time axis is one whose `units` is "<step> since <reference>" (hours since
@@ -119,11 +126,36 @@ function _carry_attrs(attrib)
     return d
 end
 
-function read_native(::NetCDFReader, path::AbstractString)
+# The set of DATA variables a `variables` projection asks for, or `nothing` for
+# "all of them" (`variables === nothing` or an EMPTY list — spec/conformance.md
+# §3, which the parquet reader and both sibling tracks already spell this way).
+# A requested name absent from the blob is an error naming what is present, so a
+# typo'd `file_variable` cannot read back as a silently missing array.
+function _netcdf_wanted(ds, dimset::AbstractSet{String}, variables)
+    (variables === nothing || isempty(variables)) && return nothing
+    want = Set(String[String(v) for v in variables])
+    present = sort!(String[String(vn) for vn in keys(ds) if !(String(vn) in dimset)])
+    absent = sort!(String[v for v in want if !(v in present)])
+    isempty(absent) || throw(ArgumentError(
+        "requested variables not in blob: $absent; present data variables: $present"))
+    return want
+end
+
+function read_native(::NetCDFReader, path::AbstractString; variables = nothing)
     nds = NativeDataset()
     NCDatasets.NCDataset(String(path), "r") do ds
         dimset = Set(String.(collect(keys(ds.dim))))
+        # PROJECTION PUSHDOWN (spec/conformance.md §3): the loader's `variables`
+        # reach the READER, so an unrequested variable is never decoded — a
+        # GEOS-FP A1 file carries 47 variables and a provider wants one. An EMPTY
+        # list means "every variable", NOT "no variables" (the same rule the
+        # parquet reader and the other two tracks follow); an absent name is an
+        # error listing what is present, never a silently missing array.
+        want = _netcdf_wanted(ds, dimset, variables)
         for vn in keys(ds)
+            name = String(vn)
+            # Coordinates are always kept; data variables honour the projection.
+            (want === nothing || name in dimset || name in want) || continue
             v = ds[vn]
             attrs = _carry_attrs(v.attrib)
             file_dims = reverse(String.(collect(NCDatasets.dimnames(v))))

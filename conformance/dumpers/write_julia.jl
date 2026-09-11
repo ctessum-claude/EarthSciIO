@@ -11,7 +11,9 @@
 # metadata is structurally compared against the Python- and Rust-written stores.
 # Conformance is TOLERANCE-BASED on decoded arrays (RFC §16.6), never byte identity.
 #
-# Usage:  julia --project=julia conformance/dumpers/write_julia.jl OUT_DIR [SPEC.json]
+# Usage:  julia --project="$(julia conformance/dumpers/julia_env.jl)" \
+#             conformance/dumpers/write_julia.jl OUT_DIR [SPEC.json]
+#         (`conformance/run_write_conformance.sh` does both steps.)
 
 using EarthSciIO
 import JSON
