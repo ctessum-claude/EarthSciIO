@@ -28,6 +28,17 @@ import numpy as np
 import pytest
 
 from earthsciio import NetCDFReader
+from earthsciio.registry import format_registry
+
+# Every test here decodes netcdf, so the whole module skips when that optional
+# stack is absent — the `Python, no optional extras` CI job installs without it,
+# and `NetCDFReader` imports xarray lazily inside `read_native`, so without this
+# the tests ERROR on `No module named 'xarray'` instead of skipping. Asks the
+# registry rather than naming modules, the same single source of truth the
+# `needs_format` marker in conftest.py uses.
+_missing = format_registry.missing_requirements("netcdf")
+pytestmark = pytest.mark.skipif(
+    bool(_missing), reason=f"netcdf stack unavailable: {', '.join(_missing)}")
 
 # dim `n=3`; `float value(n)` and `char label(n) = "abc"`. `n` is a REAL axis
 # (`value` lives on it), so `label` is three ONE-character strings.
