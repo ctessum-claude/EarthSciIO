@@ -807,6 +807,24 @@ impl Provider {
     /// Ensure the file covering `file_anchor` is decoded into the 2-entry LRU
     /// (`self.files`), so a file-period seam decodes each adjacent file at most
     /// once. On a hit the entry is moved to the tail (most-recently-used).
+    ///
+    /// **Why this Provider does not push its records into the decode.** The
+    /// netcdf reader honours a [`Records`](crate::Records) pushdown in every
+    /// track (`spec/registries.md` §2.1) and the Julia Provider uses it, because
+    /// that one computes its record from the cadence and keeps no decoded-file
+    /// buffer: there a whole-file decode per sample is pure waste. Here this LRU
+    /// IS the optimisation — one whole-file decode amortised over every tick in
+    /// the file — so pushing down would replace one decode per FILE with one per
+    /// TICK. Measured on this reader (release build, warm page cache): an
+    /// A1-shaped file (24 records, 47 2-D variables) decodes whole in 37.7 ms,
+    /// i.e. 1.57 ms per tick, against 8.3 ms for a narrowed 2-record decode —
+    /// 5.3x worse per tick; an A3dyn-shaped file (8 records, 6 3-D variables)
+    /// 104.0 ms whole = 13.0 ms per tick against 29.5 ms narrowed, 2.3x worse.
+    /// The narrowed decode is genuinely 3.5–4.6x cheaper *per decode*, which is
+    /// exactly why it is worth having on the reader and not worth wiring in
+    /// front of a buffer that already avoids most of them. A caller that wants it
+    /// calls [`Reader::read_native_records`](crate::Reader::read_native_records)
+    /// directly; a track is not made slower for symmetry.
     fn ensure_file(&mut self, file_anchor: OffsetDateTime) -> Result<()> {
         if let Some(pos) = self.files.iter().position(|(a, _)| *a == file_anchor) {
             let entry = self.files.remove(pos);

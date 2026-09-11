@@ -362,3 +362,45 @@ fn unknown_format_is_a_clean_error() {
         Ok(_) => panic!("expected UnknownFormat error for an unregistered format"),
     }
 }
+
+#[test]
+fn a_records_baked_into_reader_options_never_reaches_the_decode() {
+    // `records` is the CADENCE OWNER's option (spec/conformance.md, "One owner
+    // per record axis"). A Provider with a `temporal` resolves each anchor to a
+    // file-local record itself, so a caller-supplied `records` would narrow that
+    // axis BEHIND the resolution: with a one-record `records` every anchor would
+    // land on record 0 and `refresh` would hand back the same record forever — a
+    // constant field where the model expected to interpolate, with no error
+    // anywhere. That is the hole the Julia track had to close after making
+    // `records` a declared option there.
+    //
+    // In Rust it cannot open. A loader states its decode options as
+    // `reader_options`, resolved through `Reader::configured`, and the netcdf
+    // reader takes none: the pushdown is a per-call argument of
+    // `read_native_records`, never a configured property of a reader instance.
+    // The default `configured` REFUSES a non-empty option set rather than
+    // ignoring it, so this is an error at Provider construction. Pinned here so a
+    // later `configured` override on the netcdf reader cannot quietly open it.
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "records".to_string(),
+        serde_json::json!({"dim": "time", "indices": [0]}),
+    );
+    let temporal = SourceTemporal::new(
+        datetime!(2018-11-08 00:00:00 UTC),
+        Duration::hours(1),
+        Duration::days(1),
+    );
+    let loader = DataSource::new("era5", "netcdf", ERA5_TEMPLATE)
+        .temporal(temporal)
+        .reader_options(options);
+    match Provider::new(loader, corpus_cache(), None) {
+        Err(Error::Format { format, detail }) => {
+            assert_eq!(format, "netcdf");
+            assert!(detail.contains("takes no reader_options"), "{detail}");
+            assert!(detail.contains("records"), "{detail}");
+        }
+        Err(other) => panic!("expected a Format error, got {other}"),
+        Ok(_) => panic!("a baked `records` beside a cadence must not be accepted"),
+    }
+}

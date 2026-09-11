@@ -35,7 +35,7 @@ use netcdf_reader::{NcFile, NcType, NcVariable};
 
 use crate::error::{Error, Result};
 
-use super::{ArrayData, Coord, DType, NativeDataset, NativeField, Reader, Selection};
+use super::{ArrayData, Coord, DType, NativeDataset, NativeField, Reader, Records, Selection};
 
 /// The active `netcdf` reader: pure-Rust NetCDF-3 + NetCDF-4/HDF5 decode.
 #[derive(Debug, Default, Clone, Copy)]
@@ -63,9 +63,45 @@ impl Reader for NetcdfReader {
         variables: &[String],
         select: &Selection,
     ) -> Result<NativeDataset> {
+        self.read_native_records(blob_path, variables, select, None)
+    }
+
+    /// Honours a [`Records`] pushdown: the named records of `dim` (and of
+    /// `dim`'s own coordinate variable) are materialised, in the order given,
+    /// and nothing else along that axis is read.
+    ///
+    /// It rides the same `sel` map — and so the same hyperslab/gather machinery
+    /// — a `select` rides, on purpose: a record selection IS a one-axis index
+    /// list, and routing it anywhere else would let a record selection decode
+    /// differently from a spatial window. What differs is only WHO may ask, which
+    /// is why it arrives through its own argument with an explicit `dim` rather
+    /// than as an axis of the `select` a time dimension refuses.
+    fn read_native_records(
+        &self,
+        blob_path: &Path,
+        variables: &[String],
+        select: &Selection,
+        records: Option<&Records>,
+    ) -> Result<NativeDataset> {
         let file = NcFile::open(blob_path).map_err(fmt_err)?;
         let sel = dim_selection(&file, select)?;
+        let sel = merge_records(&file, sel, records)?;
         decode(&file, variables, sel.as_ref())
+    }
+
+    /// The `records` decode option is real in this track (`spec/registries.json`,
+    /// `format.netcdf.reader_options`), not spec-only.
+    fn supports_records(&self) -> bool {
+        true
+    }
+
+    /// NetCDF dimension lengths live in the file's **header**, so this opens the
+    /// blob and reads no array at all. It is what lets an out-of-process caller
+    /// compute the record indices of a [`Records`] pushdown before paying for the
+    /// decode that pushdown narrows.
+    fn dim_length(&self, blob_path: &Path, dim: &str) -> Result<Option<usize>> {
+        let file = NcFile::open(blob_path).map_err(fmt_err)?;
+        Ok(nc_dim_length(&file, dim)?)
     }
 
     /// Honours a per-axis `Selection` at DECODE time: the blob is already
@@ -194,6 +230,93 @@ fn dim_selection(file: &NcFile, select: &Selection) -> Result<Option<DimSelectio
         out.insert(name, axis.resolve_in(len, "netcdf")?);
     }
     Ok(if out.is_empty() { None } else { Some(out) })
+}
+
+/// The declared length of dimension `dim` in the file's header, or `None` when
+/// the file has no such dimension. Reads metadata only.
+fn nc_dim_length(file: &NcFile, dim: &str) -> Result<Option<usize>> {
+    let dims = file.dimensions().map_err(fmt_err)?;
+    Ok(dims
+        .iter()
+        .find(|d| d.name == dim)
+        .map(|d| d.size as usize))
+}
+
+/// Fold a [`Records`] pushdown into the dimension→indices map `sel` built from
+/// the `select`.
+///
+/// The two vocabularies meet here on purpose: a record selection IS a one-axis
+/// index list, so it rides the same hyperslab/gather machinery below and cannot
+/// decode differently from a spatial window. What differs is only WHO may ask —
+/// hence the separate argument and the explicit `dim`. Mirrors the Julia
+/// `_netcdf_merge_records` and the Python `_netcdf_merge_records`; the three
+/// must not drift, because the same indices have to name the same records in
+/// every track.
+fn merge_records(
+    file: &NcFile,
+    sel: Option<DimSelection>,
+    records: Option<&Records>,
+) -> Result<Option<DimSelection>> {
+    let Some(records) = records else {
+        return Ok(sel);
+    };
+    let dim = records.dim.as_str();
+    let Some(len) = nc_dim_length(file, dim)? else {
+        let mut present: Vec<String> = file
+            .dimensions()
+            .map_err(fmt_err)?
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        present.sort_unstable();
+        return Err(Error::Format {
+            format: "netcdf".to_string(),
+            detail: format!(
+                "records names dimension '{dim}', which the blob does not have; \
+                 present: {present:?}"
+            ),
+        });
+    };
+    if records.indices.is_empty() {
+        return Err(Error::Format {
+            format: "netcdf".to_string(),
+            detail: format!(
+                "records asks for no records of '{dim}'; an empty selection is an \
+                 error, not a whole-axis read"
+            ),
+        });
+    }
+    // The reader does no wrapping: an index past the end is a mistake in the
+    // caller's own record arithmetic, and reading `i % len` instead would hand
+    // back a real array of the wrong record with nothing to show for it.
+    let mut bad: Vec<usize> = records.indices.iter().copied().filter(|i| *i >= len).collect();
+    bad.sort_unstable();
+    bad.dedup();
+    if !bad.is_empty() {
+        return Err(Error::Format {
+            format: "netcdf".to_string(),
+            detail: format!(
+                "records index/indices {:?} are outside 0:{} for dimension '{dim}' \
+                 (the reader does not wrap: locating a cadence tick inside its file \
+                 is the Provider's job)",
+                bad,
+                len - 1
+            ),
+        });
+    }
+    let mut out = sel.unwrap_or_default();
+    if out.contains_key(dim) {
+        return Err(Error::Format {
+            format: "netcdf".to_string(),
+            detail: format!(
+                "select and records both narrow dimension '{dim}'; a record \
+                 selection is the Provider's and a `select` must leave the record \
+                 axis \"all\""
+            ),
+        });
+    }
+    out.insert(dim.to_string(), records.indices.clone());
+    Ok(Some(out))
 }
 
 /// Decode an opened NetCDF file into native arrays, honoring the `variables`
@@ -1281,5 +1404,430 @@ mod tests {
         // Valid classic magic + version byte, then nothing — must error cleanly.
         let err = read_bytes(b"CDF\x01\x00\x00").unwrap_err();
         assert!(matches!(err, Error::Format { .. }));
+    }
+
+    // ---- `records` pushdown (the cadence owner's record axis) --------------
+    //
+    // The committed corpus blob holds TWO records, where a two-record bracket is
+    // the whole axis and a narrowed decode cannot be told from a full one. These
+    // tests build a FOUR-record classic file instead, so every selection below is
+    // a genuine subset. The builder is ~40 lines of the CDF-1 header grammar
+    // (netCDF classic format spec §"header"); it is self-checking, because
+    // `whole_file_decode_is_the_pinned_fixture` pins the arrays it produces.
+
+    /// Append `x` big-endian.
+    fn put_u32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_be_bytes());
+    }
+
+    /// A CDF-1 `name`: length, then the bytes padded to a 4-byte boundary.
+    fn put_name(v: &mut Vec<u8>, s: &str) {
+        put_u32(v, s.len() as u32);
+        v.extend_from_slice(s.as_bytes());
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+    }
+
+    /// One `NC_DOUBLE` variable of the fixture: name, the dimension ids it lives
+    /// on, an optional `(name, value)` text attribute, and its values in
+    /// dims-order.
+    struct VarSpec {
+        name: &'static str,
+        dimids: Vec<u32>,
+        attr: Option<(&'static str, &'static str)>,
+        data: Vec<f64>,
+    }
+
+    /// Assemble a NetCDF-3 classic (CDF-1) file of all-`NC_DOUBLE`, all-FIXED
+    /// (no unlimited dimension) variables. Big-endian throughout, every field
+    /// padded to 4 bytes, `begin` offsets patched once the header length is
+    /// known.
+    fn build_cdf1(dims: &[(&str, u32)], vars: &[VarSpec]) -> Vec<u8> {
+        let mut h: Vec<u8> = Vec::new();
+        h.extend_from_slice(b"CDF\x01");
+        put_u32(&mut h, 0); // numrecs: no record (unlimited) dimension
+        put_u32(&mut h, 10); // NC_DIMENSION
+        put_u32(&mut h, dims.len() as u32);
+        for (name, len) in dims {
+            put_name(&mut h, name);
+            put_u32(&mut h, *len);
+        }
+        put_u32(&mut h, 0); // global att_list: ABSENT
+        put_u32(&mut h, 0);
+        put_u32(&mut h, 11); // NC_VARIABLE
+        put_u32(&mut h, vars.len() as u32);
+        let mut begin_at: Vec<usize> = Vec::new();
+        for v in vars {
+            put_name(&mut h, v.name);
+            put_u32(&mut h, v.dimids.len() as u32);
+            for d in &v.dimids {
+                put_u32(&mut h, *d);
+            }
+            match v.attr {
+                None => {
+                    put_u32(&mut h, 0); // vatt_list: ABSENT
+                    put_u32(&mut h, 0);
+                }
+                Some((an, av)) => {
+                    put_u32(&mut h, 12); // NC_ATTRIBUTE
+                    put_u32(&mut h, 1);
+                    put_name(&mut h, an);
+                    put_u32(&mut h, 2); // NC_CHAR
+                    put_u32(&mut h, av.len() as u32);
+                    h.extend_from_slice(av.as_bytes());
+                    while h.len() % 4 != 0 {
+                        h.push(0);
+                    }
+                }
+            }
+            put_u32(&mut h, 6); // NC_DOUBLE
+            put_u32(&mut h, (v.data.len() * 8) as u32); // vsize (already 4-aligned)
+            begin_at.push(h.len());
+            put_u32(&mut h, 0); // begin — patched below
+        }
+        let mut offset = h.len() as u32;
+        for (v, at) in vars.iter().zip(&begin_at) {
+            h[*at..*at + 4].copy_from_slice(&offset.to_be_bytes());
+            offset += (v.data.len() * 8) as u32;
+        }
+        for v in vars {
+            for x in &v.data {
+                h.extend_from_slice(&x.to_be_bytes());
+            }
+        }
+        h
+    }
+
+    const NREC: usize = 4;
+    const NLAT: usize = 2;
+    const NLON: usize = 3;
+
+    /// `t2m[r, i, j]`: distinct in the record AND in both spatial cells, so a
+    /// record read out of order, de-duplicated or off by one is a wrong NUMBER
+    /// rather than a wrong shape.
+    fn t2m_at(r: usize, i: usize, j: usize) -> f64 {
+        (100 * (r + 1) + 10 * i + j) as f64
+    }
+
+    /// A 4-record cadence file: `time(time)` with CF units, `lat`/`lon`
+    /// coordinates, `t2m(time, lat, lon)` and a `orog(lat, lon)` that carries no
+    /// record axis and must survive a pushdown untouched.
+    fn cadence_cdf1() -> Vec<u8> {
+        let mut t2m = Vec::new();
+        for r in 0..NREC {
+            for i in 0..NLAT {
+                for j in 0..NLON {
+                    t2m.push(t2m_at(r, i, j));
+                }
+            }
+        }
+        let mut orog = Vec::new();
+        for i in 0..NLAT {
+            for j in 0..NLON {
+                orog.push(7.0 + i as f64 + j as f64);
+            }
+        }
+        build_cdf1(
+            &[("time", NREC as u32), ("lat", NLAT as u32), ("lon", NLON as u32)],
+            &[
+                VarSpec {
+                    name: "time",
+                    dimids: vec![0],
+                    attr: Some(("units", "hours since 2018-11-09 00:00:00")),
+                    data: (0..NREC).map(|r| r as f64).collect(),
+                },
+                VarSpec {
+                    name: "lat",
+                    dimids: vec![1],
+                    attr: None,
+                    data: vec![40.0, 41.0],
+                },
+                VarSpec {
+                    name: "lon",
+                    dimids: vec![2],
+                    attr: None,
+                    data: vec![-90.0, -89.0, -88.0],
+                },
+                VarSpec {
+                    name: "t2m",
+                    dimids: vec![0, 1, 2],
+                    attr: None,
+                    data: t2m,
+                },
+                VarSpec {
+                    name: "orog",
+                    dimids: vec![1, 2],
+                    attr: None,
+                    data: orog,
+                },
+            ],
+        )
+    }
+
+    /// Stage the cadence fixture and read it under `records` (and `select`).
+    fn read_cadence(
+        variables: &[String],
+        select: &Selection,
+        records: Option<&Records>,
+    ) -> Result<NativeDataset> {
+        let bytes = cadence_cdf1();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        NetcdfReader::new().read_native_records(f.path(), variables, select, records)
+    }
+
+    /// One variable's `(dims, shape, f64 values)`.
+    fn field_of(ds: &NativeDataset, name: &str) -> (Vec<String>, Vec<usize>, Vec<f64>) {
+        let f = ds
+            .variables
+            .get(name)
+            .unwrap_or_else(|| panic!("a `{name}` field"));
+        let ArrayData::F64(vals) = &f.data else {
+            panic!("expected F64, got {:?}", f.data)
+        };
+        (f.dims.clone(), f.shape.clone(), vals.clone())
+    }
+
+    /// One coordinate's f64 values.
+    fn coord_of(ds: &NativeDataset, name: &str) -> Vec<f64> {
+        let c = ds
+            .coords
+            .get(name)
+            .unwrap_or_else(|| panic!("a `{name}` coord"));
+        let ArrayData::F64(vals) = &c.field.data else {
+            panic!("expected F64, got {:?}", c.field.data)
+        };
+        vals.clone()
+    }
+
+    #[test]
+    fn whole_file_decode_is_the_pinned_fixture() {
+        // The builder above is only trustworthy if the file it writes decodes to
+        // the numbers it meant to write. Every equivalence assertion below rests
+        // on this one.
+        let ds = read_cadence(&[], &Selection::All, None).expect("the cadence fixture decodes");
+        let (dims, shape, vals) = field_of(&ds, "t2m");
+        assert_eq!(dims, vec!["time", "lat", "lon"]);
+        assert_eq!(shape, vec![NREC, NLAT, NLON]);
+        assert_eq!(
+            vals,
+            vec![
+                100.0, 101.0, 102.0, 110.0, 111.0, 112.0, // record 0
+                200.0, 201.0, 202.0, 210.0, 211.0, 212.0, // record 1
+                300.0, 301.0, 302.0, 310.0, 311.0, 312.0, // record 2
+                400.0, 401.0, 402.0, 410.0, 411.0, 412.0, // record 3
+            ]
+        );
+        assert_eq!(coord_of(&ds, "time"), vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(coord_of(&ds, "lat"), vec![40.0, 41.0]);
+        assert_eq!(
+            ds.coords.get("time").unwrap().units.as_deref(),
+            Some("hours since 2018-11-09 00:00:00")
+        );
+    }
+
+    /// THE equivalence gate for the pushdown in this track: a record-selected
+    /// read is cell-for-cell the whole-file read gathered afterwards, for every
+    /// selection a cadence owner can produce — a single record, an interior
+    /// bracket, a reversed pair, the degenerate end-of-data `[last, last]`, and
+    /// the whole axis. An optimisation that changed a number would show here.
+    #[test]
+    fn record_pushdown_equals_the_whole_file_read() {
+        let whole = read_cadence(&[], &Selection::All, None).expect("whole-file read");
+        let (_, _, whole_t2m) = field_of(&whole, "t2m");
+        let whole_time = coord_of(&whole, "time");
+        let cells = NLAT * NLON;
+
+        let mut sweeps: Vec<Vec<usize>> = Vec::new();
+        for a in 0..NREC {
+            sweeps.push(vec![a]); // the `records_per_sample = 1` shape
+            for b in 0..NREC {
+                sweeps.push(vec![a, b]); // every bracket, forward, reversed, degenerate
+            }
+        }
+        sweeps.push((0..NREC).collect()); // the whole axis, stated explicitly
+        sweeps.push(vec![3, 1, 2, 0]); // a permutation
+
+        for idx in sweeps {
+            let got = read_cadence(&[], &Selection::All, Some(&Records::new("time", idx.clone())))
+                .unwrap_or_else(|e| panic!("records {idx:?}: {e}"));
+            let (dims, shape, vals) = field_of(&got, "t2m");
+            // The axis is RETAINED at the requested length and never dropped.
+            assert_eq!(dims, vec!["time", "lat", "lon"], "records {idx:?}");
+            assert_eq!(shape, vec![idx.len(), NLAT, NLON], "records {idx:?}");
+            let want: Vec<f64> = idx
+                .iter()
+                .flat_map(|r| whole_t2m[r * cells..(r + 1) * cells].to_vec())
+                .collect();
+            assert_eq!(vals, want, "records {idx:?}: pushed != whole-file gathered");
+            // The record axis's own coordinate moves WITH the data...
+            let want_time: Vec<f64> = idx.iter().map(|r| whole_time[*r]).collect();
+            assert_eq!(coord_of(&got, "time"), want_time, "records {idx:?}");
+            // ...untouched axes stay whole, and a field that does not carry the
+            // record axis passes through unchanged.
+            assert_eq!(coord_of(&got, "lat"), coord_of(&whole, "lat"));
+            assert_eq!(coord_of(&got, "lon"), coord_of(&whole, "lon"));
+            assert_eq!(field_of(&got, "orog"), field_of(&whole, "orog"));
+        }
+    }
+
+    #[test]
+    fn records_are_absolute_ordered_and_may_repeat() {
+        // Pinned ABSOLUTE values, so the equivalence sweep above cannot pass with
+        // both paths reading the wrong records. `[2]` is record 2 of four.
+        let one = read_cadence(&[], &Selection::All, Some(&Records::new("time", vec![2])))
+            .expect("one record");
+        assert_eq!(
+            field_of(&one, "t2m").2,
+            vec![300.0, 301.0, 302.0, 310.0, 311.0, 312.0]
+        );
+        assert_eq!(coord_of(&one, "time"), vec![2.0]);
+
+        // Order is the order GIVEN, not sorted.
+        let rev = read_cadence(&[], &Selection::All, Some(&Records::new("time", vec![3, 1])))
+            .expect("a reversed pair");
+        assert_eq!(
+            field_of(&rev, "t2m").2,
+            vec![400.0, 401.0, 402.0, 410.0, 411.0, 412.0, 200.0, 201.0, 202.0, 210.0, 211.0, 212.0]
+        );
+        assert_eq!(coord_of(&rev, "time"), vec![3.0, 1.0]);
+
+        // Duplicates are LEGAL — the end-of-data bracket `[last, last]` is one,
+        // and a reader that de-duplicated would hand back one record where two
+        // were asked for.
+        let dup = read_cadence(&[], &Selection::All, Some(&Records::new("time", vec![3, 3])))
+            .expect("the degenerate end-of-data bracket");
+        let (_, shape, vals) = field_of(&dup, "t2m");
+        assert_eq!(shape, vec![2, NLAT, NLON]);
+        assert_eq!(
+            vals,
+            vec![400.0, 401.0, 402.0, 410.0, 411.0, 412.0, 400.0, 401.0, 402.0, 410.0, 411.0, 412.0]
+        );
+        assert_eq!(coord_of(&dup, "time"), vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn records_compose_with_a_projection_and_a_spatial_select() {
+        // `variables`, `select` and `records` are three independent narrowings of
+        // one decode and must compose: project, window, then records.
+        let sel = Selection::Orthogonal(vec![
+            AxisSelect::All, // time — left whole, as a `select` must
+            AxisSelect::Indices(vec![1]),
+            AxisSelect::Range {
+                start: 0,
+                stop: 3,
+                step: 2,
+            },
+        ]);
+        let got = read_cadence(
+            &["t2m".to_string()],
+            &sel,
+            Some(&Records::new("time", vec![2, 0])),
+        )
+        .expect("all three narrowings together");
+        assert_eq!(got.variables.keys().collect::<Vec<_>>(), vec!["t2m"]);
+        let (dims, shape, vals) = field_of(&got, "t2m");
+        assert_eq!(dims, vec!["time", "lat", "lon"]);
+        assert_eq!(shape, vec![2, 1, 2]);
+        assert_eq!(
+            vals,
+            vec![
+                t2m_at(2, 1, 0),
+                t2m_at(2, 1, 2),
+                t2m_at(0, 1, 0),
+                t2m_at(0, 1, 2)
+            ]
+        );
+        assert_eq!(coord_of(&got, "time"), vec![2.0, 0.0]);
+        assert_eq!(coord_of(&got, "lat"), vec![41.0]);
+        assert_eq!(coord_of(&got, "lon"), vec![-90.0, -88.0]);
+    }
+
+    #[test]
+    fn a_select_still_may_not_narrow_the_time_axis() {
+        // `records` moves nothing about the boundary the `select` refusal draws:
+        // a reader still may not CHOOSE records, it may only be told them.
+        let sel = Selection::Orthogonal(vec![
+            AxisSelect::Indices(vec![0]),
+            AxisSelect::All,
+            AxisSelect::All,
+        ]);
+        let err = read_cadence(&[], &sel, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("record selection is the Provider's"),
+            "{err}"
+        );
+        // ...and it is refused just the same beside a `records`.
+        let err = read_cadence(&[], &sel, Some(&Records::new("time", vec![0]))).unwrap_err();
+        assert!(format!("{err}").contains("must be \"all\""), "{err}");
+    }
+
+    #[test]
+    fn a_bad_records_is_an_error_not_a_wrapped_or_widened_read() {
+        // Out of range: the reader is told the records and never the cadence, so
+        // it does no `mod1` — `4` of a 4-record file is a mistake in the caller's
+        // own arithmetic, not record 0.
+        for bad in [vec![4], vec![0, 9], vec![usize::MAX]] {
+            let err = read_cadence(&[], &Selection::All, Some(&Records::new("time", bad.clone())))
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("outside 0:3"), "records {bad:?}: {msg}");
+        }
+        // A dimension the blob does not have.
+        let err = read_cadence(&[], &Selection::All, Some(&Records::new("nope", vec![0])))
+            .unwrap_err();
+        assert!(format!("{err}").contains("which the blob does not have"), "{err}");
+        // An EMPTY selection is an error, not a whole-axis read: a caller that
+        // computed no records has a bug, and handing it every record would bury
+        // it under a correct-looking array.
+        let err =
+            read_cadence(&[], &Selection::All, Some(&Records::new("time", vec![]))).unwrap_err();
+        assert!(format!("{err}").contains("empty selection is an error"), "{err}");
+        // `select` and `records` may not both narrow the same dimension.
+        let sel = Selection::Orthogonal(vec![
+            AxisSelect::All,
+            AxisSelect::Indices(vec![0]),
+            AxisSelect::All,
+        ]);
+        let err = read_cadence(&[], &sel, Some(&Records::new("lat", vec![0]))).unwrap_err();
+        assert!(format!("{err}").contains("both narrow dimension"), "{err}");
+    }
+
+    #[test]
+    fn dim_length_reads_the_header_and_is_declared() {
+        // The metadata-only half of the pushdown: the record indices a cadence
+        // owner wants are a function of the file's length along the record axis,
+        // so that length has to be knowable BEFORE the decode it narrows.
+        let bytes = cadence_cdf1();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let r = NetcdfReader::new();
+        assert_eq!(r.dim_length(f.path(), "time").unwrap(), Some(NREC));
+        assert_eq!(r.dim_length(f.path(), "lon").unwrap(), Some(NLON));
+        assert_eq!(r.dim_length(f.path(), "no-such-dim").unwrap(), None);
+        // ...and the capability is DECLARED, which is what tells a caller the
+        // option is real in this track (spec/registries.json).
+        assert!(r.supports_records());
+
+        // Every other reader inherits "I cannot answer that" and refuses a
+        // pushdown rather than silently reading the whole record axis.
+        let other = crate::format::Ff10Reader::new();
+        assert!(!other.supports_records());
+        assert_eq!(other.dim_length(f.path(), "time").unwrap(), None);
+        let err = other
+            .read_native_records(
+                f.path(),
+                &[],
+                &Selection::All,
+                Some(&Records::new("time", vec![0])),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("does not honour a `records` pushdown"),
+            "{err}"
+        );
     }
 }

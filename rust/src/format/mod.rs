@@ -251,6 +251,50 @@ pub enum Selection {
     Orthogonal(Vec<AxisSelect>),
 }
 
+/// A **record pushdown**: the records of one dimension the cadence owner has
+/// already chosen (`spec/registries.md` §2.1, `spec/conformance.md` "NetCDF
+/// decode notes").
+///
+/// This is the other half of the rule that makes a [`Selection`] refuse a time
+/// axis. The refusal says the reader may not *choose* records, not that every
+/// record must be decoded: `Records` is the separate channel through which
+/// whoever owns the cadence states the records it wants, in the file's **own**
+/// 0-based numbering. The reader is told the records and never the cadence — it
+/// does no modular arithmetic, knows nothing of `records_per_sample`, and
+/// materialises exactly `indices` of `dim` (and of `dim`'s own coordinate
+/// variable) **in the order given**.
+///
+/// - **Duplicates are legal.** The end-of-data bracket `[last, last]` is one, and
+///   a reader that de-duplicated would hand back one record where two were asked
+///   for.
+/// - **An index outside `0..len` is an error**, never a wrapped read: locating a
+///   cadence tick inside its file is the caller's job. (A *negative* index is
+///   unrepresentable here, which is the same rule the `usize` of
+///   [`AxisSelect::Indices`] states.)
+/// - **An empty `indices` is an error**, not a whole-axis read.
+/// - `Records` and a `Selection` may be combined but **must not both narrow
+///   `dim`**.
+///
+/// [`Reader::dim_length`] is the metadata-only read that makes `indices`
+/// computable before the decode they are meant to narrow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Records {
+    /// The dimension whose records are being chosen (e.g. `"time"`).
+    pub dim: String,
+    /// Absolute, file-local, 0-based record indices, honoured in this order.
+    pub indices: Vec<usize>,
+}
+
+impl Records {
+    /// A record pushdown of `indices` along `dim`.
+    pub fn new(dim: impl Into<String>, indices: Vec<usize>) -> Self {
+        Self {
+            dim: dim.into(),
+            indices,
+        }
+    }
+}
+
 /// One array dimension's selector in an orthogonal [`Selection::Orthogonal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxisSelect {
@@ -352,6 +396,64 @@ pub trait Reader: Send + Sync {
         variables: &[String],
         select: &Selection,
     ) -> Result<NativeDataset>;
+
+    /// [`read_native`](Reader::read_native) under a [`Records`] pushdown: the
+    /// records of one dimension the cadence owner has already chosen.
+    ///
+    /// `records = None` is exactly [`read_native`](Reader::read_native).
+    /// `Some(_)` on a reader that does not honour it is an **error** rather than
+    /// a whole-axis read — the caller asked for two of a file's twenty-four
+    /// records and would otherwise be handed all twenty-four with no sign that
+    /// its selection was dropped, which the tick→record slicing downstream would
+    /// then index wrongly. Callers gate on
+    /// [`supports_records`](Reader::supports_records).
+    ///
+    /// The default implementation is that error, so every existing reader keeps
+    /// its current behaviour and none silently ignores a pushdown.
+    fn read_native_records(
+        &self,
+        blob_path: &Path,
+        variables: &[String],
+        select: &Selection,
+        records: Option<&Records>,
+    ) -> Result<NativeDataset> {
+        match records {
+            None => self.read_native(blob_path, variables, select),
+            Some(r) => Err(crate::Error::Format {
+                format: self.formats().first().copied().unwrap_or("native").to_string(),
+                detail: format!(
+                    "reader does not honour a `records` pushdown, but one was asked \
+                     for along dimension '{}'; read the whole record axis and slice \
+                     on the caller's side instead",
+                    r.dim
+                ),
+            }),
+        }
+    }
+
+    /// Whether this reader honours a [`Records`] pushdown in
+    /// [`read_native_records`](Reader::read_native_records). Default `false`;
+    /// mirrors the Julia/Python declaration of `records` as a reader option
+    /// (`spec/registries.md` §2.1), which is what tells a caller the option is
+    /// real in THIS track rather than only in the spec.
+    fn supports_records(&self) -> bool {
+        false
+    }
+
+    /// The length of dimension `dim` in the blob at `blob_path`, read from the
+    /// file's METADATA — the header, never an array (`spec/registries.md` §2.3).
+    ///
+    /// `None` when the reader cannot answer (the default every reader inherits)
+    /// or when the blob has no such dimension; a caller must treat that as "read
+    /// whole and slice on my own side" rather than as an error. The whole-file
+    /// counterpart of [`array_shape`](Reader::array_shape), and what makes a
+    /// [`Records`] pushdown expressible out of process at all: the records a
+    /// cadence owner wants are a function of the file's length along the record
+    /// axis, so that length has to be known before the decode the selection is
+    /// meant to narrow.
+    fn dim_length(&self, _blob_path: &Path, _dim: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
 
     /// Whether this reader is **store-backed**: its source is not one fetchable
     /// blob but a directory-like store (a Zarr v2 store, whose `.zarray`/
