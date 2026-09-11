@@ -61,6 +61,37 @@ prefetch(pd)                      # warm the cache for every tick's URL, no deco
 argument wins. `EARTHSCIDATADIR` selects the cache root (default on
 `/scratch.local`, never `/u`).
 
+### HTTP transport timeouts
+
+The `http`/`https`/`s3` transport bounds a fetch on three independent axes: a
+bytes/s floor (a stalled socket), a per-attempt wall-clock cap (a lost-wakeup
+deadlock, which no socket-level floor can see), and a cap on the whole call. A
+per-attempt cap alone would also cap the *size* of a fetchable blob, so an
+attempt that timed out **having written bytes** buys a 4× bigger cap and is not
+charged a retry — up to `EARTHSCIIO_HTTP_TIMEOUT_MAX`, which bounds the entire
+`fetch!` call, retries and backoff included.
+
+That ceiling is per *kind of fetch*, chosen by the caller (never inferred from
+the URL): a **whole blob** is one self-contained file and may legitimately be
+multi-GB, but a **store-backed read** (the zarr reader) fetches one *object* per
+`fetch!` call — a chunk, hundreds per scan — so it uses the lower
+`EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE` and a pathological source cannot block one
+small chunk for hours.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EARTHSCIIO_HTTP_TIMEOUT` | `90` | per-attempt wall-clock cap (s) |
+| `EARTHSCIIO_HTTP_TIMEOUT_MAX` | `7200` | cap on any one extended attempt, and — together with a `RETRIES × TIMEOUT` floor — on the **whole** fetch of one URL (s) |
+| `EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE` | `600` | the same ceiling for a store-backed (one object per call) read, e.g. a zarr chunk (s) |
+| `EARTHSCIIO_HTTP_RETRIES` | `5` | attempts charged (a progress-earning attempt is refunded) |
+| `EARTHSCIIO_HTTP_LOW_SPEED_LIMIT` | `1024` | bytes/s floor |
+| `EARTHSCIIO_HTTP_LOW_SPEED_TIME` | `30` | abort after this long below the floor (s) |
+| `EARTHSCIIO_HTTP_CONNECT_TIMEOUT` | `30` | connect timeout (s) |
+
+A retry restarts the transfer at byte zero (no `Range` resume), so a blob that
+needs more than `EARTHSCIIO_HTTP_TIMEOUT` seconds is downloaded more than once;
+raise `EARTHSCIIO_HTTP_TIMEOUT` for a workload that is known to be large.
+
 ## Tests
 
 ```bash

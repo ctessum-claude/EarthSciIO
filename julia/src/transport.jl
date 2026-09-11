@@ -72,13 +72,40 @@ end
 # after a failed/aborted transfer, whose handle may be wedged).
 _reset_http_downloader!() = (_HTTP_DOWNLOADER[] = nothing)
 
+# The ceiling on one fetch (both on any single extended attempt and, with the
+# retry floor below, on the whole call). It depends on WHAT is being fetched, and
+# only the CALLER knows that -- the transport must never infer it from the URL or
+# from a size it has not fetched yet:
+#
+#   * a WHOLE BLOB (`store_read=false`, the default) is one self-contained file
+#     and can legitimately be multi-GB -- a 0.25 deg GEOS-FP A3dyn day is 3.80 GB
+#     -- so it keeps the long 7200 s ceiling: better a slow success than a failure
+#     that forces the whole file to be downloaded again from byte zero.
+#   * a STORE-BACKED READ (`store_read=true`) is ONE OBJECT of a directory-like
+#     store -- a Zarr chunk, `.zarray`, `.zattrs` -- and `fetch!` is called once
+#     PER OBJECT (zarr.jl), hundreds of times in one scan. A chunk is small by
+#     construction (the pinned ISRM store's are ~21 MB decompressed; a chunk that
+#     needed hours would defeat the point of chunking), so 2 h per object is the
+#     wrong shape of bound: a pathological source would block on ONE chunk for
+#     two hours and the scan would take that times its object count. Minutes, not
+#     hours: 600 s still covers a 100 MB chunk at a very poor 200 KB/s, and still
+#     leaves room for one full 90 -> 360 s extension step plus a retry after it.
+#
+# Both go through the same `max(ceiling, tries * timeout)` floor at the call site,
+# so NEITHER ceiling can take away retries the un-extended schedule would have had
+# -- lowering it only shortens the extension ladder.
+_http_store_read_ceiling(store_read::Bool) =
+    store_read ? _http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX_STORE", 600) :
+                 _http_env_int("EARTHSCIIO_HTTP_TIMEOUT_MAX", 7200)
+
 """HTTP/HTTPS transport: GET with conditional-GET revalidation. Mirror failover
 is handled at the call site (the cache tries mirror URLs in order)."""
 struct HttpTransport <: Transport end
 schemes(::HttpTransport) = ["http", "https"]
 
 function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)
     headers = Pair{String,String}[]
     append!(headers, auth_headers(auth, url))
     et = get(conditional, :etag, nothing)
@@ -87,14 +114,49 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
     lm === nothing || push!(headers, "If-Modified-Since" => lm)
 
     tries   = max(1, _http_env_int("EARTHSCIIO_HTTP_RETRIES", 5))
-    timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-request hard cap (s)
+    timeout = Float64(_http_env_int("EARTHSCIIO_HTTP_TIMEOUT", 90))  # per-ATTEMPT cap (s)
+    tmax    = Float64(_http_store_read_ceiling(store_read))
+    base_timeout = timeout
+    # `timeout` is a TOTAL per-request cap, so on its own it also caps the SIZE
+    # of a blob this transport can fetch: at a realistic 40 MB/s the 90 s default
+    # gives up at ~3.5 GB, and single-file scientific archives are already past
+    # that (a 0.25 deg GEOS-FP A3dyn day is 3.80 GB). Raising the default instead
+    # would blunt what the cap is for -- the lost-wakeup deadlock, which must not
+    # be allowed to hang for the raised value.
+    #
+    # Distinguish the two by PROGRESS, which is exactly what separates them: a
+    # deadlocked or stalled transfer delivers no bytes, a healthy large one does.
+    # An attempt that timed out HAVING GROWN `dest` earns a bigger budget and is
+    # not charged a retry; one that timed out at a standstill is the failure the
+    # cap exists to bound, and it still dies in `timeout` seconds. The low-speed
+    # abort above (bytes/s floor, independently configurable) catches a trickle
+    # BELOW the floor -- but a trickle just ABOVE it is aborted by nothing, and
+    # grows `dest` on every attempt, so it earns every extension.
+    #
+    # The ladder must nonetheless compose into a BOUNDED wall time: `fetch!` is
+    # called once per zarr chunk object (zarr.jl), so an unbounded per-URL retry
+    # budget is the very hang this cap exists to prevent -- a source trickling
+    # just above the bytes/s floor is never aborted by libcurl and would walk the
+    # whole ladder (90+360+1440+5760+7200 s) and then still be charged its
+    # retries. One deadline for the whole call bounds that: `tmax` (see
+    # `_http_store_read_ceiling` -- shorter for a per-object store read than for a
+    # whole blob) is the ceiling on the ENTIRE fetch, and each attempt is clamped
+    # to what is left.
+    # The floor of `tries * timeout` keeps the deadline from ever taking away
+    # retries the un-extended schedule would have had, so lowering `TIMEOUT_MAX`
+    # only shortens the extension ladder -- it never makes plain retries worse.
+    budget   = max(tmax, tries * timeout)
+    deadline = time() + budget
+    extensions = 0
     local resp
-    for attempt in 1:tries
+    attempt = 0
+    while attempt < tries
+        attempt += 1
         ok = false
         try
             resp = Downloads.request(url; method = "GET", output = dest,
                                      headers = headers, throw = false,
-                                     timeout = timeout,
+                                     timeout = min(timeout, max(deadline - time(), 0.001)),
                                      downloader = _http_downloader())
             # CRITICAL: with `throw=false`, a transport failure (stall abort, connect
             # timeout, or a Downloads-level `timeout` cancelling a lost-wakeup
@@ -109,9 +171,35 @@ function fetch!(::HttpTransport, url::AbstractString, dest::AbstractString;
         end
         ok && break
         _reset_http_downloader!()   # rebuild the possibly-wedged multi-handle
-        if attempt == tries
+        # Progress-earned extension: this attempt moved bytes, so it is a large
+        # transfer outgrowing its budget, not a wedged one. Grow the cap and
+        # refund the attempt (bounded, so a pathologically slow server still
+        # terminates).
+        #
+        # The progress signal is the bytes THIS attempt wrote, which is exactly
+        # `filesize(dest)`: every attempt reopens `dest` for writing and so
+        # truncates it (see the backoff comment below), and therefore restarts
+        # the transfer at byte zero. Comparing against the PREVIOUS attempt's
+        # leftover size instead would mis-read a healthy transfer whose rate
+        # merely dropped -- 3.6 GB in the first attempt then 1.8 GB in the
+        # (longer) second reads as "shrank", i.e. as a wedge -- and would
+        # reset the budget and burn the retries on a transfer that is plainly
+        # moving bytes.
+        grew = (isfile(dest) ? filesize(dest) : 0) > 0
+        if grew && timeout < tmax && extensions < 6 && time() < deadline
+            timeout = min(timeout * 4, tmax)
+            extensions += 1
+            attempt -= 1
+            continue
+        end
+        # No progress: whatever this was, it is not a transfer outgrowing its
+        # budget, so hand the next attempt the ORIGINAL cap -- a wedge must never
+        # inherit an extension earned by an earlier, healthy attempt.
+        timeout = base_timeout
+        if attempt >= tries || time() >= deadline
             resp isa Exception && throw(resp)
-            error("http transport: GET $url failed after $tries attempts: $resp")
+            error("http transport: GET $url failed after $attempt attempt(s) " *
+                  "(within a $(round(Int, budget)) s budget): $resp")
         end
         sleep(min(2.0^(attempt - 1), 10.0))   # partial `dest` truncated by next open
     end
@@ -141,7 +229,8 @@ struct FileTransport <: Transport end
 schemes(::FileTransport) = ["file"]
 
 function fetch!(::FileTransport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)   # a local copy has no timeout to bound
     src = file_url_to_path(url)
     isfile(src) || error("file transport: source not found: $src (from $url)")
     cp(src, dest; force = true)
@@ -206,7 +295,9 @@ S3Transport(; region = nothing) = S3Transport(region === nothing ? nothing : Str
 schemes(::S3Transport) = ["s3"]
 
 function fetch!(t::S3Transport, url::AbstractString, dest::AbstractString;
-                conditional = NamedTuple(), auth::AuthResolver = NoAuth())
+                conditional = NamedTuple(), auth::AuthResolver = NoAuth(),
+                store_read::Bool = false)
     https_url = s3_https_url(url, t.region)
-    return fetch!(t.http, https_url, dest; conditional = conditional, auth = auth)
+    return fetch!(t.http, https_url, dest; conditional = conditional, auth = auth,
+                  store_read = store_read)
 end

@@ -132,7 +132,7 @@ end
 
 """
     fetch_blob(cache, resolved_url; source_loader=nothing, auth_realm=nothing,
-               ttl=nothing, revalidate=false) -> CacheEntry
+               ttl=nothing, revalidate=false, store_read=false) -> CacheEntry
 
 Return the cached blob for `resolved_url`, fetching it first if necessary.
 
@@ -145,10 +145,15 @@ Return the cached blob for `resolved_url`, fetching it first if necessary.
 
 `ttl` (seconds) expires a present blob and forces revalidation; `revalidate`
 forces it unconditionally. `auth_realm` selects a resolver from a realm→resolver
-`auth` map and is recorded (name only) in the manifest."""
+`auth` map and is recorded (name only) in the manifest. `store_read=true` says
+this URL is ONE OBJECT of a store-backed read (a Zarr chunk, fetched once per
+object) rather than a whole blob, and is passed to the transport, which bounds
+such a fetch more tightly — the caller knows which it is; the transport must not
+guess (transport.jl, `_http_store_read_ceiling`)."""
 function fetch_blob(c::Cache, resolved_url::AbstractString;
                     source_loader = nothing, auth_realm = nothing,
-                    ttl::Union{Real,Nothing} = nothing, revalidate::Bool = false)
+                    ttl::Union{Real,Nothing} = nothing, revalidate::Bool = false,
+                    store_read::Bool = false)
     key = cache_key(resolved_url)
     bp = get_blob(c.store, key)
     present = bp !== nothing
@@ -166,7 +171,8 @@ function fetch_blob(c::Cache, resolved_url::AbstractString;
     # or `revalidate` was set — so we WANT a conditional GET, not a presence
     # short-circuit. If it is absent, we are filling a miss (and a blob that
     # appears under the lock means a peer filled it: reuse it).
-    return _locked_fetch(c, resolved_url, key, source_loader, auth_realm, present)
+    return _locked_fetch(c, resolved_url, key, source_loader, auth_realm, present,
+                         store_read)
 end
 
 # Validity for the lock-free fast path. Offline: presence (+ optional integrity).
@@ -199,7 +205,8 @@ function _verify_integrity(c::Cache, url, key, bp)
     return nothing
 end
 
-function _locked_fetch(c::Cache, url, key, source_loader, auth_realm, want_revalidate)
+function _locked_fetch(c::Cache, url, key, source_loader, auth_realm, want_revalidate,
+                       store_read::Bool = false)
     return lock_key(c.store, key) do
         # Re-check under the lock. When filling a miss, a blob that appeared
         # means a peer process just filled it — reuse it, take no download. When
@@ -220,7 +227,8 @@ function _locked_fetch(c::Cache, url, key, source_loader, auth_realm, want_reval
         try
             res = fetch!(transport, url, staged;
                          conditional = conditional,
-                         auth = resolve_auth(c.auth, auth_realm))
+                         auth = resolve_auth(c.auth, auth_realm),
+                         store_read = store_read)
 
             if res.status == :not_modified
                 bp2 = get_blob(c.store, key)
